@@ -1,6 +1,6 @@
-# MM-VLM-TT
+# Align-TAPER: Aligning Multimodal Vision-Language Models with Test-Time Adaptive Personalization for Nuanced Emotion Recognition
 
-Multimodal (vision–language) experiments around CLIP-style models: test-time prompt tuning, AU-related adapters, and zero-shot evaluation on affect / pain / stress-style benchmarks.
+Official implementation (repository **MM-VLM-TT**): multimodal vision–language alignment with test-time adaptive personalization for nuanced emotion recognition—CLIP-style backbones, prompt tuning, and related adapters on affect- and stress-oriented benchmarks.
 
 ## Environment
 
