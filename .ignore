@@ -16,3 +16,4 @@ WeightFiles/
 *.tflite
 *.mlmodel
 *.weights
+*.xlsx
