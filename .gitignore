@@ -38,3 +38,7 @@ __pycache__/
 
 # Project-local bundle (not for VCS)
 dfew/
+.~lock.experiment_logs_mr.xlsx#
+.~lock.experiment_logs_nofus.xlsx#
+.~lock.experiment_logs.xlsx#
+.~lock.experiment_logs2.xlsx#
