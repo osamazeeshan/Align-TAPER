@@ -1,0 +1,18 @@
+# Training / run logs
+logs/
+
+# Project weight directory (see config.WEIGHTS_FOLDER)
+WeightFiles/
+
+# Model checkpoints and weights (any location)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+*.pb
+*.tflite
+*.mlmodel
+*.weights
