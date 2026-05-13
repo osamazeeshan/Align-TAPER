@@ -17,3 +17,24 @@ WeightFiles/
 *.mlmodel
 *.weights
 *.xlsx
+*.csv
+
+# Python bytecode (all __pycache__ dirs, any depth)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool / test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.ipynb_checkpoints/
+*.egg-info/
+.eggs/
+
+# Generic cache directories
+.cache/
+
+# Project-local bundle (not for VCS)
+dfew/
