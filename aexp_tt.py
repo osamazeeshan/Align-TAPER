@@ -8,6 +8,7 @@ from copy import deepcopy
 from PIL import Image
 import numpy as np
 import csv
+import copy
 
 import torch
 import torch.nn.parallel
@@ -23,7 +24,10 @@ from thop import profile
 
 import matplotlib.pyplot as plt
 import torchvision
-from sklearn.metrics import accuracy_score, f1_score, recall_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, recall_score, confusion_matrix, classification_report
+
+from audio.opensmile_audio_dic import *
+from utils.visualize_audio_clusters import *
 
 
 try:
@@ -231,6 +235,8 @@ def load_txt_adapter_classifier(save_path, model, args, device):
             model.temporal.load_state_dict(checkpoint["temporal"])
         if "temporal_proj" in checkpoint:
             model.temporal_proj.load_state_dict(checkpoint["temporal_proj"])
+        if "audio_fusion_alpha" in checkpoint:
+            model.audio_fusion_alpha.copy_(checkpoint["audio_fusion_alpha"])
 
     model = model.cuda(args.gpu)
     return model
@@ -325,8 +331,8 @@ def rebuild_optimizer(model, lr):
 
     return optimizer
 
-def main():
-    args = parser.parse_args()
+def main(args):
+    # args = parser.parse_args()
     set_random_seed(get_default_seed())
     # visualize_metrics_from_csv("metrics/comparison_tran.csv")
 
@@ -335,6 +341,9 @@ def main():
     args.target_sub_set = 10
     # print(calculate_aggregate_performance(filename="best_metrics_"+str(args.target_sub_set)+".csv"))
     # print(calculate_aggregate_performance(filename="clip_au_metrics_"+str(args.target_sub_set)+".csv"))
+
+    # plot_cluster_summary_table()
+    # plot_label_acoustic_summary()
 
     if args.current_ds is config.BIOVID:
         '''
@@ -483,8 +492,10 @@ def main():
         # if args.load_t_adpt_cl_mod:
         # args.srcs_file_name = f'lab_srcs44_stress_ep20_bs{args.batch_size}_sql{args.seq_len}_str{args.frame_stride}_fus{args.fus_type}_modAlign{args.is_mod_align}' 
 
-        args.srcs_file_name = f'lab_srcs44_stress_ep{args.t_adap_epoch}_bs8_sql{args.seq_len}_str{args.frame_stride}_fus{args.fus_type}_modAlign{args.is_mod_align}_newgoff' 
-        # args.srcs_file_name='lab_srcs44_stress_ep20_bs8_sql16_str1_vid_mm_align'
+        # args.srcs_file_name = f'lab_srcs44_stress_ep{args.t_adap_epoch}_bs8_sql{args.seq_len}_str{args.frame_stride}_fus{args.fus_type}_modAlign{args.is_mod_align}_newgoff' 
+        # args.srcs_file_name='lab_srcs44_stress_ep20_bs8_sql16_str1_vid_mm_audio_dic'
+        # args.srcs_file_name='lab_srcs44_stress_ep20_bs8_sql16_str1_vid_mm_audio_dic_mcs_3_ms_3_audio_fusion_alpha=True'
+        args.srcs_file_name='lab_srcs44_stress_ep20_bs8_sql16_str1_vid_mm_audio_dic_og'
         args.pain_db_root_path = config.STRESS_PATH
         args.test_sets = 'stresssub0/stresssub1/stresssub2/stresssub3/stresssub4/stresssub5/stresssub6/stresssub7/stresssub8/stresssub9'        
         args.srcs_label_file_name= 'stress_source_sub_labels'
@@ -492,7 +503,7 @@ def main():
     elif args.current_ds is config.BAH:
         # if args.load_t_adpt_cl_mod:
         #     args.srcs_file_name= 'lab_srcs44_stress_ep20_bs8_sql'+str(16)+'_str'+str(args.frame_stride)+'_vid'
-        args.srcs_file_name='bah_src_ep10_bs8_sql16_str2_vid_wind100'
+        args.srcs_file_name='bah_src_ep10_bs8_sql6_str1_vid_mm_audio_dic_og'
         args.pain_db_root_path = config.BAH_DATASET_FRAMES_PATH
         args.test_sets = 'bahssub0/bahssub1/bahssub2/bahssub3/bahssub4/bahssub5/bahssub6/bahssub7/bahssub8/bahssub9'
         # args.test_sets = 'bahssub0'
@@ -548,9 +559,7 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
     print("Use GPU: {} for training".format(args.gpu))
     print("Train text adpt and classifier model: ", args.train_t_adpt_cl)
     print("Load train text adpt and classifier model: ", args.load_t_adpt_cl_mod)
-
-    # device = torch.device(f"cuda:{args.gpu}") if torch.cuda.is_available() else torch.device("cpu")
-
+    
     # create model (zero-shot clip model (ViT-L/14@px336) with promptruning)
     if args.test_sets in fewshot_datasets:
         classnames = eval("{}_classes".format(args.test_sets.lower()))
@@ -576,7 +585,11 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
 
     else:
         model = get_coop(args.arch, args.test_sets, args.gpu, args.n_ctx, args.ctx_init, 
-                        num_aus=len(AU_PROMPTS), num_classes=len(classnames), au_prompts=AU_PROMPTS, is_video_clip=args.is_video_clip, frame_stride=args.frame_stride)
+                        num_aus=len(AU_PROMPTS), num_classes=len(classnames), au_prompts=AU_PROMPTS, 
+                        is_video_clip=args.is_video_clip, frame_stride=args.frame_stride, save_audio_dict=(
+                        args.audio_dict_dir + "/opensmile_feature_cluster_dictionary.npy"), 
+                        opensmile_scaler_path=(args.audio_dict_dir + "/opensmile_scaler.pkl"), 
+                        audio_cluster_labels_path=(args.audio_dict_dir + "/cluster_labels.npy"))
         if args.load is not None:
             print("Use pre-trained soft prompt (CoOp) as initialization")
             pretrained_ctx = torch.load(args.load)['state_dict']['ctx']
@@ -602,7 +615,8 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
             # if "au_classifier" in name:
             #     param.requires_grad_(True)
 
-            if any(k in name for k in ["text_adapter", "temporal_classifier", "temporal"]):
+            # if any(k in name for k in ["text_adapter", "temporal_classifier", "temporal"]):
+            if any(k in name for k in ["text_adapter", "temporal", "temporal_classifier", "audio_fusion_alpha", "visual_align_proj", "audio_align_proj"]):
                 param.requires_grad_(True)
             # if any(k in name for k in ["au_classifier", "text_adapter", "temporal_classifier"]):
             #     param.requires_grad_(True)
@@ -610,7 +624,7 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
         if args.adapt_tar_sub:
             # Freeze everything by default
             # for name, param in model.named_parameters():
-            if any(k in name for k in ["au_prompt_learner"]):
+            if any(k in name for k in ["au_prompt_learner", "subject_fusion_delta"]):
                 param.requires_grad_(True)
             # if "temporal_classifier" in name:
             #     param.requires_grad_(True)
@@ -653,13 +667,16 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
                 trainable_params = (
                     list(model.text_adapter.parameters()) +
                     list(model.temporal.parameters()) +
-                    list(model.temporal_classifier.parameters()) 
-                    # list(model.crossAtten_fusion.parameters())
+                    list(model.temporal_classifier.parameters()) +
+                    [model.audio_fusion_alpha] +
+                    list(model.visual_align_proj.parameters()) +
+                    list(model.audio_align_proj.parameters())
                 )
                 print("[INFO] Training AU adapter, AU classifier, audio_adapter fusion_mlp, and temporal transformer (video mode).")
         elif args.adapt_tar_sub:
             if args.au_prompt_tune:
-                trainable_params = model.au_prompt_learner.parameters()
+                trainable_params = (list(model.au_prompt_learner.parameters()) + [model.subject_fusion_delta])
+                
                 # trainable_params = (
                 #     list(model.au_prompt_learner.parameters()) +
                 #     list(model.temporal_proj.parameters())
@@ -717,6 +734,7 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
 
     for set_id in datasets:
         # comet create experiment name
+        tar_subject_id = int(set_id[-1])
         set_comet_exp_name(experiment, len(source_list_name), True, len(source_list_name), str())
         if args.current_ds is config.FERV39k or args.current_ds is config.DFEW or args.current_ds is config.MAFW:
             tar_sub_list = target_subject_list[0]
@@ -761,7 +779,7 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
             data_transform = AugMixAugmenter(base_transform, preprocess, n_views=0, 
                                             augmix=len(set_id)>1)
             if args.adapt_per_video:
-                batchsize = 8
+                batchsize = 1
             elif args.load_t_adpt_cl_mod and args.eval_au_tar_sb:
                 batchsize = args.tar_batch_size
             else:
@@ -849,11 +867,41 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
             # Compare different landmark selections
             visualizer.compare_landmark_selections(image_idx=1000, landmark_counts=[5, 15, 30, 50], save_path="visual/landmark_comparison.png")
         
+
+        if args.create_audio_dictionary:
+            if not args.infer_audio_dictionary:
+                if args.current_ds is config.RAF_DB:
+                    raise ValueError("create_audio_dictionary requires a video dataset with audio (not RAF_DB)")
+                print("=== Creating OpenSMILE audio dictionary from source train data ===")
+                create_opensmile_audio_dictionary(srcs_loader, val_loader)
+                print("=== OpenSMILE audio dictionary created ===")
+                return
+
+            # if not args.infer_audio_dictionary:
+            print("=== Inference OpenSMILE audio dictionary from source train data ===")
+            # vis_result = visualize_opensmile_clusters_standalone_withoutnoise(
+            #     dictionary_dir="outputs/opensmile_activ_dbscan_feat_dict",
+            #     method="tsne",
+            #     perplexity=30,
+            #     save_dir="outputs/cluster_visualizations",
+            # )
+            # vis_result = visualize_opensmile_clusters_standalone_withoutnoise(
+            #     dictionary_dir=args.audio_dict_dir,
+            #     method="umap",
+            #     perplexity=30,
+            #     save_dir="outputs/cluster_visualizations_umap",
+            # )
+            infer_opensmile_dbsacn_feature_cluster_dictionary(test_loader=val_loader, dictionary_dir=args.audio_dict_dir, sub_id=tar_subject_id, tar_sub_code=tar_sub_list)
+            # infer_opensmile_feature_cluster_dictionary(val_loader)
+            # infer_opensmile_audio_dictionary(val_loader)
+            print("=== Done audio dictionary Infer ===")
+            continue
+
         emoclip_model = None
         # emoclip_model = VClip(args.arch, device)
         # model = load_partial_checkpoint(model, 'ViT_B_32_bah.pth')
         # emoclip_model = load_clip_encoders('1.pth', emoclip_model, device) # 1.pth
-        if args.load_t_adpt_cl_mod:
+        if not args.create_audio_dictionary and args.load_t_adpt_cl_mod:
             saved_model = load_txt_adapter_classifier(source_model_path, model, args, device)
             print("[INFO] AU Adapter and Classifier Loaded: ", source_model_path)
             # saved_model.visualize_au_text_embeddings(AU_PROMPTS, device="cuda")
@@ -871,13 +919,13 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
                 TSNE_ALL_SUB_VIDEOS, TSNE_ALL_SUB_LABLES = evaluate_txt_adapter_n_au_classifier(args, model, val_loader, sub_id, tar_sub_list, args.eval_au_tar_sb)
                 continue
         # continue
-        if args.train_t_adpt_cl or args.train_whole_clip_model:
+        if not args.create_audio_dictionary and (args.train_t_adpt_cl or args.train_whole_clip_model):
             model = train_txt_adapter_n_au_classifier(args, model, emoclip_model, val_loader if args.current_ds is config.RAF_DB else srcs_loader, srcs_val_loader,
                                             scaler, optimizer, optim_state, classnames, source_model_path, num_epochs=args.t_adap_epoch, 
                                             save_path=source_model_path, train_clip_model=args.train_whole_clip_model)
             evaluate_txt_adapter_n_au_classifier(args, model, val_loader if args.current_ds is config.RAF_DB else srcs_val_loader, set_id, tar_sub_list)
             break
-        if args.adapt_tar_sub:
+        if not args.create_audio_dictionary and args.adapt_tar_sub:
             target_path = os.path.join(target_weight_path, 'adapt_model.pth')
             # if args.adapt_per_video:
             #     model = target_adapt_per_video( args, model, val_loader, scaler, source_model_path,
@@ -907,7 +955,6 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
         except KeyError:
             print("=> Acc. on testset [{}]: {:.2f}".format(set_id, results[set_id]))
 
-
     # Concatenate across subjects
     # TSNE_ALL_SUB_VIDEOS = torch.cat(TSNE_ALL_SUB_VIDEOS, dim=0)  # [N_total, 512]
     # TSNE_ALL_SUB_LABLES = torch.cat(TSNE_ALL_SUB_LABLES, dim=0)              # [N_total]
@@ -921,6 +968,596 @@ def main_worker(gpu, args, file_name, source_list_name, target_subject_list):
         r = results[id]
         print(f"{id}\t{r['war']:.2f}\t{r['uar']:.2f}\t{r['f1_macro']:.2f}")
 
+
+
+def create_opensmile_audio_dictionary(
+    train_loader,
+    val_loader,
+    output_dir="outputs/opensmile_audio_dictionary_4",
+    sample_rate=16000,
+    prototypes_per_class=4,
+):
+    """
+    Create OpenSMILE audio dictionary from train_loader.
+
+    Expected train_loader batch:
+        feat, images, audio_arr, labels, video_path
+
+    Args:
+        train_loader: PyTorch DataLoader
+        output_dir: folder to save dictionary files
+        sample_rate: audio sample rate
+        prototypes_per_class:
+            1 = one prototype per emotion class
+            >1 = multiple prototypes per emotion class using KMeans
+
+    Returns:
+        result dictionary with dictionary, labels, features, etc.
+    """
+
+    # builder = OpenSMILEAudioDictionaryBuilder(
+    #     sample_rate=sample_rate,
+    #     prototypes_per_class=prototypes_per_class,
+    # )
+
+    # result = builder.fit_from_loader(
+    #     train_loader=train_loader,
+    #     output_dir=output_dir,
+    # )
+
+    """
+    Build an audio dictionary by clustering similar OpenSMILE feature patterns.
+
+    Important:
+        Labels are NOT used to create clusters.
+        Labels are only used after clustering to assign a majority-vote class
+        to each cluster for evaluation/prediction.
+
+    Pipeline:
+        audio_arr
+        → OpenSMILE feature
+        → normalize
+        → KMeans clustering over all samples
+        → dictionary = cluster centers
+        → cluster label = majority GT label inside that cluster
+    """
+
+    min_cluster_size_values = [3, 5, 7, 10, 15]
+    min_samples_values = [1, 2, 3, 5, 7]
+
+    all_results = []
+
+    for min_cluster_size in min_cluster_size_values:
+        for min_samples in min_samples_values:
+
+            # Optional: avoid overly strict settings
+            if min_samples > min_cluster_size:
+                continue
+
+            output_dir = (
+                "outputs/opensmile_activ_dbscan_feat_dict/"
+                f"mcs_{min_cluster_size}_ms_{min_samples}"
+            )
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            print("=" * 80)
+            print(f"Running HDBSCAN with:")
+            print(f"min_cluster_size = {min_cluster_size}")
+            print(f"min_samples      = {min_samples}")
+            print(f"output_dir       = {output_dir}")
+            print("=" * 80)
+
+            cluster_dict = OpenSMILEActivatedFeatureClusterDictionary(
+                sample_rate=16000,
+                num_clusters=8,              # not used by HDBSCAN, but can keep it
+                activation_threshold=0,
+                positive_only=False,
+            )
+
+            result = cluster_dict.fit_hdbscan(
+                train_loader=train_loader,
+                output_dir=output_dir,
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                include_noise_dictionary=False,
+            )
+
+            # Store useful run information
+            run_info = {
+                "min_cluster_size": min_cluster_size,
+                "min_samples": min_samples,
+                "output_dir": output_dir,
+                "result": result,
+            }
+
+            all_results.append(run_info)
+
+    # Save full sweep summary
+    summary_path = "outputs/opensmile_activ_dbscan_feat_dict/hdbscan_sweep_summary.json"
+
+    with open(summary_path, "w") as f:
+        json.dump(all_results, f, indent=4)
+
+    print(f"Saved HDBSCAN sweep summary to: {summary_path}")
+
+    # cluster_dict = OpenSMILEActivatedFeatureClusterDictionary(
+    #     sample_rate=16000,
+    #     num_clusters=8,
+    #     activation_threshold=0,
+    #     positive_only=False,
+    # )
+
+    # result = cluster_dict.fit(
+    #     train_loader=train_loader,
+    #     output_dir="outputs/opensmile_activated_feature_cluster_dictionary"
+    # )
+
+    # result = cluster_dict.fit_hdbscan(
+    #     train_loader=train_loader,
+    #     output_dir="outputs/opensmile_activ_dbscan_feat_dict",
+    #     min_cluster_size=7,
+    #     min_samples=5,
+    #     include_noise_dictionary=False,
+    # )
+
+    # train_metrics = cluster_dict.evaluate(train_loader)
+    # print("Source Train: ", train_metrics)
+    # test_metrics = cluster_dict.evaluate(val_loader)
+    # print("Source Test: ", test_metrics)
+
+    # vis_result = cluster_dict.visualize_clusters(
+    #     dictionary_dir="outputs/opensmile_activ_dbscan_feat_dict",
+    #     method="umap",
+    #     save_dir="outputs/opensmile_activ_dbscan_feat_dict/visualization",
+    # )
+
+    # cluster_ids = result["cluster_ids"]
+
+    # num_noise = np.sum(cluster_ids == -1)
+    # total = len(cluster_ids)
+
+    # print("Noise samples:", num_noise, "/", total)
+    # print("Noise percentage:", 100 * num_noise / total)
+    # print("Discovered clusters:", sorted(set(cluster_ids) - {-1}))
+
+    # print_cluster_top_features(result, top_k=10)
+    # return result
+
+def infer_opensmile_audio_dictionary(train_loader, output_dir="outputs/opensmile_audio_dictionary", label_to_name=None):
+    inferencer = OpenSMILEAudioDictionaryInferencer(
+        dictionary_dir="outputs/opensmile_audio_dictionary_4",
+        sample_rate=16000,
+    )
+
+    y_true = []
+    y_pred = []
+
+    for feat, audio_arr, labels, video_path in tqdm(train_loader, desc="Evaluating"):
+
+        # Move to CPU numpy
+        if isinstance(audio_arr, torch.Tensor):
+            audio_arr = audio_arr.detach().cpu().numpy()
+
+        if isinstance(labels, torch.Tensor):
+            labels = labels.detach().cpu().numpy()
+
+        # audio_arr: [B, T]
+        # labels: [B]
+        batch_size = audio_arr.shape[0]
+
+        for i in range(batch_size):
+            one_audio = audio_arr[i]      # [T]
+            true_label = labels[i]
+
+            # convert GT label if needed
+            if label_to_name is not None:
+                true_label = label_to_name[int(true_label)]
+
+            # predict by closest dictionary prototype
+            sim_result = inferencer.compute_similarity(one_audio)
+
+            pred_label = sim_result["best_label"]
+
+            if isinstance(pred_label, np.generic):
+                pred_label = pred_label.item()
+
+            y_true.append(true_label)
+            y_pred.append(pred_label)
+
+    # -------------------------
+    # Final results
+    # -------------------------
+    correct = sum(yt == yp for yt, yp in zip(y_true, y_pred))
+    total = len(y_true)
+
+    war = accuracy_score(y_true, y_pred)
+    uar = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+    print("\n================ Audio Dictionary Results ================")
+    print(f"Correct: {correct}/{total}")
+    print(f"WAR / Accuracy: {war:.4f}")
+    print(f"UAR / Macro Recall: {uar:.4f}")
+    print(f"Macro F1: {f1:.4f}")
+
+    # print("\nClassification Report:")
+    # print(classification_report(y_true, y_pred, zero_division=0))
+
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(y_true, y_pred))
+
+    return {
+        "correct": correct,
+        "total": total,
+        "war": war,
+        "uar": uar,
+        "f1": f1,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "confusion_matrix": confusion_matrix(y_true, y_pred),
+    }
+
+
+def print_cluster_top_features(result, top_k=10):
+    dictionary = result["dictionary"]
+    feature_names = result["feature_names"]
+    cluster_metadata = result["cluster_metadata"]
+
+    for cluster_id, center in enumerate(dictionary):
+        top_idx = np.argsort(np.abs(center))[::-1][:top_k]
+
+        print(f"\nCluster {cluster_id}")
+        print("Assigned label:", cluster_metadata[cluster_id]["assigned_label_majority_vote"])
+        print("Num samples:", cluster_metadata[cluster_id]["num_samples"])
+        print("Label distribution:", cluster_metadata[cluster_id]["label_distribution"])
+
+        print("Top features:")
+        for idx in top_idx:
+            print(f"  {feature_names[idx]}: {center[idx]:.4f}")
+
+def infer_opensmile_feature_cluster_dictionary(test_loader, label_to_name=None, print_report=True):
+
+    cluster_dict = OpenSMILEFeatureClusterDictionary(sample_rate=16000).load(
+        "outputs/opensmile_feature_cluster_dictionary"
+    )
+
+    """
+    Inference/evaluation for OpenSMILE feature-cluster audio dictionary.
+
+    This version assumes the dictionary was built by clustering samples
+    based on similar OpenSMILE feature patterns, not by grouping labels first.
+
+    Expected loader batch:
+        feat, audio_arr, labels, video_path
+
+    Expected audio_arr:
+        [B, T]
+
+    Expected labels:
+        [B]
+
+    Args:
+        test_loader:
+            DataLoader for evaluation.
+
+        cluster_dict:
+            A fitted OpenSMILEFeatureClusterDictionary object.
+            It must already contain:
+                cluster_dict.dictionary
+                cluster_dict.cluster_labels
+                cluster_dict.scaler
+                cluster_dict.smile
+
+        label_to_name:
+            Optional dict to map numeric labels to names.
+            Example:
+                {
+                    0: "anger",
+                    1: "disgust",
+                    2: "fear",
+                    3: "happy",
+                    4: "neutral",
+                    5: "sad",
+                    6: "surprise",
+                }
+
+        print_report:
+            Whether to print classification report.
+
+    Returns:
+        Dictionary containing metrics and predictions.
+    """
+
+    y_true = []
+    y_pred = []
+    y_cluster = []
+    y_score = []
+
+    for feat, audio_arr, labels, video_path in tqdm(test_loader, desc="Evaluating feature-cluster dictionary"):
+
+        # Move to CPU numpy
+        if isinstance(audio_arr, torch.Tensor):
+            audio_arr = audio_arr.detach().cpu().numpy()
+
+        if isinstance(labels, torch.Tensor):
+            labels = labels.detach().cpu().numpy()
+
+        # Expected:
+        # audio_arr: [B, T]
+        # labels:    [B]
+        batch_size = audio_arr.shape[0]
+
+        for i in range(batch_size):
+            one_audio = audio_arr[i]
+            true_label = labels[i]
+
+            # Convert GT label if needed
+            if label_to_name is not None:
+                true_label = label_to_name[int(true_label)]
+
+            # Prediction:
+            # audio -> OpenSMILE -> normalize -> closest cluster center
+            result = cluster_dict.predict_one(one_audio)
+
+            pred_label = result["pred_label"]
+            best_cluster = result["best_cluster"]
+            best_score = result["best_score"]
+
+            # Convert numpy scalar to Python scalar
+            if isinstance(pred_label, np.generic):
+                pred_label = pred_label.item()
+
+            y_true.append(true_label)
+            y_pred.append(pred_label)
+            y_cluster.append(best_cluster)
+            y_score.append(best_score)
+
+    # -------------------------
+    # Final results
+    # -------------------------
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    correct = int(np.sum(y_true == y_pred))
+    total = len(y_true)
+
+    war = accuracy_score(y_true, y_pred)
+    uar = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+    labels_order = sorted(np.unique(np.concatenate([y_true, y_pred])).tolist())
+    cm = confusion_matrix(y_true, y_pred, labels=labels_order)
+
+    print("\n================ Feature-Cluster Audio Dictionary Results ================")
+    print(f"Correct: {correct}/{total}")
+    print(f"WAR / Accuracy: {war:.4f}")
+    print(f"UAR / Macro Recall: {uar:.4f}")
+    print(f"Macro F1: {f1:.4f}")
+
+    print("\nLabels order:")
+    print(labels_order)
+
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    if print_report:
+        print("\nClassification Report:")
+        print(
+            classification_report(
+                y_true,
+                y_pred,
+                labels=labels_order,
+                zero_division=0,
+            )
+        )
+
+    return {
+        "correct": correct,
+        "total": total,
+        "war": war,
+        "uar": uar,
+        "f1": f1,
+        "labels_order": labels_order,
+        "confusion_matrix": cm,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "predicted_cluster": np.asarray(y_cluster),
+        "best_similarity_score": np.asarray(y_score),
+    }
+
+def infer_opensmile_dbsacn_feature_cluster_dictionary(
+    test_loader,
+    dictionary_dir="outputs/opensmile_feature_cluster_dictionary",
+    label_to_name=None,
+    print_report=True,
+    sub_id=None, 
+    tar_sub_code=None,
+):
+    """
+    Inference/evaluation for OpenSMILE activation feature-cluster dictionary.
+
+    Works with:
+        KMeans activation dictionary
+        HDBSCAN activation dictionary
+
+    Expected loader batch:
+        feat, audio_arr, labels, video_path
+
+    or:
+        feat, images, audio_arr, labels, video_path
+
+    Prediction:
+        audio
+        -> OpenSMILE
+        -> StandardScaler
+        -> threshold activation
+        -> L2 normalize
+        -> cosine similarity to dictionary atoms
+        -> closest dictionary atom
+        -> predicted label = majority label of closest atom
+    """
+
+    cluster_dict = OpenSMILEActivatedFeatureClusterDictionary(sample_rate=16000).load(
+        dictionary_dir
+    )
+
+    y_true = []
+    y_pred = []
+    y_cluster = []
+    y_score = []
+    y_active_count = []
+
+    for batch in tqdm(test_loader, desc="Evaluating feature-cluster dictionary"):
+
+        if len(batch) == 4:
+            feat, audio_arr, labels, video_path = batch
+        elif len(batch) == 5:
+            feat, images, audio_arr, labels, video_path = batch
+        else:
+            raise ValueError(
+                f"Expected batch length 4 or 5, got {len(batch)}"
+            )
+
+        # Move to CPU numpy
+        if isinstance(audio_arr, torch.Tensor):
+            audio_arr = audio_arr.detach().cpu().numpy()
+
+        if isinstance(labels, torch.Tensor):
+            labels = labels.detach().cpu().numpy()
+
+        # Expected audio_arr: [B, T]
+        # Expected labels: [B]
+        batch_size = audio_arr.shape[0]
+
+        for i in range(batch_size):
+            one_audio = audio_arr[i]
+            true_label = labels[i]
+
+            if label_to_name is not None:
+                true_label = label_to_name[int(true_label)]
+
+            result = cluster_dict.predict_one(one_audio)
+
+            pred_label = result["pred_label"]
+            best_cluster = result["best_cluster"]
+            best_score = result["best_score"]
+
+            num_active_features = result.get("num_active_features", None)
+
+            # Convert numpy scalar to Python scalar
+            if isinstance(pred_label, np.generic):
+                pred_label = pred_label.item()
+
+            if isinstance(true_label, np.generic):
+                true_label = true_label.item()
+
+            # Skip invalid predictions if any cluster has no assigned label
+            if pred_label is None:
+                continue
+
+            y_true.append(true_label)
+            y_pred.append(pred_label)
+            y_cluster.append(best_cluster)
+            y_score.append(best_score)
+
+            if num_active_features is not None:
+                y_active_count.append(num_active_features)
+
+    # -------------------------
+    # Final results
+    # -------------------------
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    correct = int(np.sum(y_true == y_pred))
+    total = len(y_true)
+
+    war = accuracy_score(y_true, y_pred)
+    uar = recall_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+    f1 = f1_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    labels_order = sorted(
+        np.unique(
+            np.concatenate([y_true, y_pred])
+        ).tolist()
+    )
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=labels_order,
+    )
+
+    print("\n================ Feature-Cluster Audio Dictionary Results ================")
+    print(f"Dictionary path: {dictionary_dir}")
+    print(f"Evaluated samples: {total}")
+    print(f"Correct: {correct}/{total}")
+    print(f"WAR / Accuracy: {war:.4f}")
+    print(f"UAR / Macro Recall: {uar:.4f}")
+    print(f"Macro F1: {f1:.4f}")
+
+    if len(y_active_count) > 0:
+        print(f"Average active features: {np.mean(y_active_count):.2f}")
+
+    print("\nLabels order:")
+    print(labels_order)
+
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    if print_report:
+        print("\nClassification Report:")
+        print(
+            classification_report(
+                y_true,
+                y_pred,
+                labels=labels_order,
+                zero_division=0,
+            )
+        )
+
+    min_cluster_size = dictionary_dir.split("mcs_")[1].split("_ms_")[0]
+    min_samples = dictionary_dir.split("mcs_")[1].split("_ms_")[1]
+    if str(sub_id).strip() in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']:
+        update_subject_result_xlsx(
+            technique=f"mcs_{min_cluster_size}_ms_{min_samples}",
+            filename="experiment_logs_audio_dict.xlsx", 
+            bs=args.batch_size, 
+            temp=1, 
+            subject_name=f"Sub-{sub_id}", 
+            subject_code=tar_sub_code, 
+            war=f"{war:.4f}",
+            uar=f"{uar:.4f}", 
+            f1=f"{f1:.4f}",
+            is_last_subject=True # Set to True only for your final subject (e.g., Sub-10)
+        )
+
+    return {
+        "correct": correct,
+        "total": total,
+        "war": war,
+        "uar": uar,
+        "f1": f1,
+        "labels_order": labels_order,
+        "confusion_matrix": cm,
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "predicted_cluster": np.asarray(y_cluster),
+        "best_similarity_score": np.asarray(y_score),
+        "active_count": np.asarray(y_active_count),
+        "dictionary_dir": dictionary_dir,
+    }
 
 def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, val_loader, scaler, optimizer, optim_state, classnames, source_model_path,
                                       num_epochs=10, save_path="clip_au_model_vit32_au46.pth", train_clip_model=False):
@@ -958,6 +1595,8 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
     cam_extractor = GradCAM(model.temporal, target_layer="conv3")  # or "cnn.2" if Sequential
 #   trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 #   print("Trainable params:", trainable)
+    # for nom, parametre in model.named_parameters():
+    #     print(f"{nom}: {parametre.requires_grad}")
     for epoch in range(num_epochs):
         # model.train()
         running_loss = 0.0
@@ -977,6 +1616,7 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
             images = images.cuda(args.gpu, non_blocking=True) if args.current_ds is not config.RAF_DB else images[0].cuda(args.gpu, non_blocking=True)
             labels = labels.cuda(args.gpu, non_blocking=True)
             audio_arr = audio_arr.cuda(args.gpu, non_blocking=True)
+            optimizer.zero_grad()
 
             # model.visualize_video_alignment_tsne(images, AU_PROMPTS, args.adapt_tar_sub, args.key_frame_sel, args.key_frames, device="cuda")
             # model.visualize_video_text_au_tsne(images, AU_PROMPTS, args.adapt_tar_sub, args.key_frame_sel, args.key_frames, labels, device="cuda")
@@ -1006,9 +1646,9 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
             with torch.cuda.amp.autocast():
                 if args.adapt_tar_sub:
                     # start = time.time()
-                    logits, au_sim = model(images, AU_PROMPTS, class_prompt if args.include_cls_prompt else None, mode=("temporal" if args.is_video_clip else "au"), 
-                                adapt_target=args.adapt_tar_sub, key_frame_sel=args.key_frame_sel, train_whole_clip=train_clip_model, key_frames=args.key_frames)   # forward pass
-
+                    logits, au_sim, _, L_align = model(images, audio_arr, AU_PROMPTS, class_prompt if args.include_cls_prompt else None, mode=("temporal" if args.is_video_clip else "au"), 
+                                adapt_target=args.adapt_tar_sub, key_frame_sel=args.key_frame_sel, train_whole_clip=train_clip_model, key_frames=args.key_frames, 
+                                fus_type=args.fus_type, mod_align=args.is_mod_align, is_opensmile_dict=args.is_opensmile_dict)   # forward pass
                     
                     # feature_cam_visualization(model, au_sim, itera, device, target_class=None, top_k=5)
 
@@ -1018,7 +1658,13 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
 
                     
                     # pred_prob = F.softmax(logits, dim=-1)
-                    loss = entropy_loss(logits, class_weights)
+                    loss = entropy_loss(logits, class_weights)    # Use CrossEntropyLoss; when not using softmax prob of visual and audio
+
+                    # loss = F.nll_loss(
+                    #     torch.log(logits.clamp_min(1e-8)),
+                    #     labels,
+                    # )
+
                     # fused_probs = (prob * au_prior)
                     # fused_probs = fused_probs / fused_probs.sum()
 
@@ -1034,8 +1680,13 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
                 else:
                     # start = time.time()
                     logits, au_sim, _, L_align = model(images, audio_arr, AU_PROMPTS, CLASS_PROMPTS if args.include_cls_prompt else None, mode=("temporal" if args.is_video_clip else "au"), 
-                                adapt_target=args.adapt_tar_sub, train_whole_clip=train_clip_model, fus_type=args.fus_type, mod_align=args.is_mod_align)   # forward pass
-                    loss = criterion(logits, labels)     # loss, DO NOT .item() here
+                                adapt_target=args.adapt_tar_sub, train_whole_clip=train_clip_model, fus_type=args.fus_type, mod_align=args.is_mod_align, is_opensmile_dict=args.is_opensmile_dict)   # forward pass
+                    # loss = criterion(logits, labels)     # loss, DO NOT .item() here
+                    
+                    loss = F.nll_loss(
+                        torch.log(logits.clamp_min(1e-8)),
+                        labels,
+                    )
 
                     if train_clip_model:
                         loss_t = criterion(logits, labels)
@@ -1048,7 +1699,7 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
                 t_loss = loss + (w_align*L_align)
             else:
                 t_loss = loss 
-            optimizer.zero_grad()
+            # optimizer.zero_grad()
             scaler.scale(t_loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -1140,6 +1791,8 @@ def train_txt_adapter_n_au_classifier(args, model, emoclip_model, train_loader, 
                         save_dict["temporal_proj"] = model.temporal_proj.state_dict()
                     if hasattr(model, "temporal_classifier"):
                         save_dict["temporal_classifier"] = model.temporal_classifier.state_dict()
+                    if hasattr(model, "audio_fusion_alpha"):
+                        save_dict["audio_fusion_alpha"] = model.audio_fusion_alpha.detach().cpu().clone()
                     
                     print(f"[INFO] Saving video model components: {list(save_dict.keys())}")
                     torch.save(save_dict, save_path)
@@ -1425,9 +2078,9 @@ def evaluate_txt_adapter_n_au_classifier(args, model, data_loader, sub_id, tar_s
             labels = labels.cuda(args.gpu, non_blocking=True)
 
             logits, _, _, _ = model(images, audio_arr, au_prompts=AU_PROMPTS, class_prompts=CLASS_PROMPTS if args.include_cls_prompt else None,
-                    mode=("temporal" if args.is_video_clip else "au"), fus_type=args.fus_type, mod_align=args.is_mod_align)
-            pred_prob = F.softmax(logits, dim=-1)
-            preds = torch.argmax(pred_prob, dim=-1)
+                    mode=("temporal" if args.is_video_clip else "au"), fus_type=args.fus_type, mod_align=args.is_mod_align, is_opensmile_dict=args.is_opensmile_dict)
+            # pred_prob = F.softmax(logits, dim=-1) # uncommneted when not using negative likelihood loss
+            preds = torch.argmax(logits, dim=-1)
             # print(f"Probs: {pred_prob}")
 
             all_preds.append(preds.cpu())
@@ -1795,7 +2448,7 @@ if __name__ == '__main__':
                         help='number of data loading workers (default: 4)')
     parser.add_argument('-b', '--batch-size', default=8, type=int, metavar='N')
     parser.add_argument('-tar_b', '--tar_batch-size', default=1, type=int, metavar='N')
-    parser.add_argument('--lr', '--learning-rate', default=0.001, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                         metavar='LR', help='initial learning rate', dest='lr') # 5e-3, for biovid and stress = 0.001
     parser.add_argument('-p', '--print-freq', default=500, type=int,
                         metavar='N', help='print frequency (default: 10)')
@@ -1835,13 +2488,13 @@ if __name__ == '__main__':
 
     parser.add_argument('--train_whole_clip_model', type=bool, default=False, help="Train complete Clip model using au PROMPTS")
 
-    parser.add_argument('--train_t_adpt_cl', type=bool, default=False, help="train_txt_adapt_classifer")
+    parser.add_argument('--train_t_adpt_cl', type=bool, default=True, help="train_txt_adapt_classifer")
     parser.add_argument('--t_adap_epoch', default=10, type=int, help="Text and AU classifier training epochs")
     parser.add_argument('--iter_limit', default=8000, type=int, help='Limit loop')
 
-    parser.add_argument('--load_t_adpt_cl_mod', type=bool, default=True, help="load_t_adpt_cl_mod")
+    parser.add_argument('--load_t_adpt_cl_mod', type=bool, default=False, help="load_t_adpt_cl_mod")
     parser.add_argument('--eval_au_adpt_cl', type=bool, default=False, help="eval_au_adpt_cl")
-    parser.add_argument('--eval_au_tar_sb', type=bool, default=True, help="eval_au_tar_sb")
+    parser.add_argument('--eval_au_tar_sb', type=bool, default=False, help="eval_au_tar_sb")
     
     parser.add_argument('--include_cls_prompt', type=bool, default=False, help="include_cls_prompt")
 
@@ -1875,6 +2528,19 @@ if __name__ == '__main__':
     
     # parser.add_argument('--srcs_file_name', default='rafdb_src_au_adapt_cl', type=str, help='Source file name to train AU adapter and classifier')
 
+    # =========================================================== Audio dictionary
+    parser.add_argument('--create_audio_dictionary', action='store_true', default=True,
+                        help='Build OpenSMILE audio dictionary from source train_loader and exit (no train/eval)')
+
+    parser.add_argument('--infer_audio_dictionary', action='store_true', default=False,
+                        help='Infer OpenSMILE audio dictionary from source train_loader')
+
+    parser.add_argument('--is_opensmile_dict', action='store_true', default=True,
+                        help='Activate OpenSMILE audio dictionary')
+
+    parser.add_argument('--audio_dict_dir', type=str, default="outputs/opensmile_activ_dbscan_feat_dict_bah", 
+                        help="Audio dictionary directory")
+
     # =========================================================== Video
     parser.add_argument('--is_video_clip', type=bool, default=True, help="Train Clip on videos")
     parser.add_argument('--seq_len', default=16, type=int, help="Video / Sequence Length")
@@ -1885,9 +2551,43 @@ if __name__ == '__main__':
     parser.add_argument('--top_timestamp', type=str, default='1754805485')
 
      # =========================================================== NEw FOr MM-VLM
-    parser.add_argument('--fus_type', type=int, default=config.FUS_MOE, help="Fusion concatenation")
+    parser.add_argument('--fus_type', type=int, default=None, help="Fusion concatenation")
     # parser.add_argument('--is_fus_crossatten', type=bool, default=False, help="Fusion Cross-Attention")
-    parser.add_argument('--is_mod_align', type=bool, default=True, help="Modality alignment")
+    parser.add_argument('--is_mod_align', type=bool, default=False, help="Modality alignment")
 
 
-    main()
+
+    args = parser.parse_args()
+
+    # base_audio_dict_dir = args.audio_dict_dir
+
+    # min_cluster_size_values = [3, 5, 7, 10]
+    # min_samples_values = [1, 2, 3, 5]
+
+    # for min_cluster_size in min_cluster_size_values:
+    #     for min_samples in min_samples_values:
+
+    #         if min_samples > min_cluster_size:
+    #             continue
+
+    #         audio_dict_dir = os.path.join(
+    #             base_audio_dict_dir,
+    #             f"mcs_{min_cluster_size}_ms_{min_samples}",
+    #         )
+
+    #         if not os.path.exists(audio_dict_dir):
+    #             print(f"Skipping missing directory: {audio_dict_dir}")
+    #             continue
+
+    #         run_args = copy.deepcopy(args)
+    #         run_args.audio_dict_dir = audio_dict_dir
+
+    #         print("=" * 80)
+    #         print(f"Running with dictionary:")
+    #         print(f"min_cluster_size = {min_cluster_size}")
+    #         print(f"min_samples      = {min_samples}")
+    #         print(f"audio_dict_dir   = {run_args.audio_dict_dir}")
+    #         print("=" * 80)
+
+    #         main(run_args)
+    main(args)

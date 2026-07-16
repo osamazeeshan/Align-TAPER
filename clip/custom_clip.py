@@ -11,6 +11,8 @@ from sklearn.metrics import pairwise_distances
 import numpy as np
 import seaborn as sns
 import os
+import opensmile
+import joblib
 
 from clip import load, tokenize
 from clip.audio import audio_load
@@ -809,7 +811,8 @@ class ClipTestTimeVideoTuning(nn.Module):
                  n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False,
                  num_aus=46, num_classes=2, text_hidden=512, clf_hidden=256,
                  d_model=192, num_layers=2, nhead=4, dim_forward=512,
-                 delta_stride=1, audio_arch="wavlm-large"):
+                 delta_stride=1, audio_arch="wavlm-large", audio_dictionary_path=None, opensmile_scaler_path=None, 
+                 audio_cluster_labels_path=None, audio_response_hidden=128, audio_dropout=0.2, audio_feature_dim=88):
         super(ClipTestTimeVideoTuning, self).__init__()
 
         # -------------------------------------------------------
@@ -836,14 +839,24 @@ class ClipTestTimeVideoTuning(nn.Module):
         audio_model, hidden_dim, audio_fe = audio_load(audio_arch, device=device)
         self.audio_model = audio_model
         self.audio_fe = audio_fe
+        self.num_classes = num_classes
 
         # Audio adapter (trainable)
-        self.audio_adapter = nn.Sequential(
-            nn.Linear(hidden_dim, text_hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(text_hidden, text_hidden),
-            nn.LayerNorm(text_hidden)
+        # self.audio_adapter = nn.Sequential(
+        #     nn.Linear(hidden_dim, text_hidden),
+        #     nn.ReLU(inplace=True),
+        #     nn.Dropout(0.3),
+        #     nn.Linear(text_hidden, text_hidden),
+        #     nn.LayerNorm(text_hidden)
+        # )
+
+        # ----------------------------------------------------------
+        # 2️⃣.1 Audio Fixed OpenSMILE feature extractor
+        # ----------------------------------------------------------
+        # This is not trainable. It converts waveform -> 88-D features.
+        self.opensmile_model = opensmile.Smile(
+            feature_set=opensmile.FeatureSet.eGeMAPSv02,
+            feature_level=opensmile.FeatureLevel.Functionals,
         )
 
         # -------------------------------------------------------
@@ -923,6 +936,181 @@ class ClipTestTimeVideoTuning(nn.Module):
         self.router = nn.Linear(512 * 2, 2)
 
         self.contr_logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
+
+        # ==================================================
+        # 4. Load fixed OpenSMILE audio dictionary
+        # ==================================================
+
+        if os.path.exists(audio_cluster_labels_path):
+            cluster_labels_np = np.load(audio_cluster_labels_path)  # shape [K]
+            self.register_buffer(
+                "audio_cluster_labels",
+                torch.tensor(cluster_labels_np, dtype=torch.long),
+                persistent=True,
+            )
+        else:
+            cluster_labels_np = None
+
+        # if audio_dictionary_path is None:
+        #     raise ValueError(
+        #         "audio_dictionary_path must point to the saved "
+        #         "OpenSMILE dictionary .npy file."
+        #     )
+
+        # if not os.path.exists(audio_dictionary_path):
+        #     raise FileNotFoundError(
+        #         f"Audio dictionary not found: {audio_dictionary_path}"
+        #     )
+
+        if os.path.exists(audio_dictionary_path):
+            audio_dictionary_np = np.load(
+                audio_dictionary_path
+            )
+
+            audio_dictionary_np = np.asarray(
+                audio_dictionary_np,
+                dtype=np.float32,
+            )
+
+            audio_dictionary_np = np.nan_to_num(
+                audio_dictionary_np,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            if audio_dictionary_np.ndim != 2:
+                raise ValueError(
+                    "Audio dictionary must have shape [N, 88], "
+                    f"but received {audio_dictionary_np.shape}."
+                )
+            self.num_audio_atoms = audio_dictionary_np.shape[0]
+
+        # audio_dictionary = torch.as_tensor(
+        #     audio_dictionary_np,
+        #     dtype=torch.float32,
+        # )
+
+
+        self.audio_feature_dim = audio_dictionary_np.shape[1]
+
+        if self.audio_feature_dim != 88:
+            raise ValueError(
+                "Expected an 88-D eGeMAPSv02 dictionary, "
+                f"but received dimension {self.audio_feature_dim}."
+            )
+
+        audio_dictionary_tensor = torch.from_numpy(
+            audio_dictionary_np
+        )
+
+        # IMPORTANT:
+        # Store the exact source-derived dictionary.
+        # Do not transform or normalize it here.
+        self.register_buffer(
+            "audio_dictionary",
+            audio_dictionary_tensor,
+            persistent=True,
+        )
+
+        # ----------------------------------------------------------
+        # Load scaler used when constructing the dictionary
+        # ----------------------------------------------------------
+        if opensmile_scaler_path is None:
+            raise ValueError(
+                "opensmile_scaler_path is required because inference/training "
+                "features must use the same scaler as the source dictionary."
+            )
+
+        if not os.path.exists(opensmile_scaler_path):
+            raise FileNotFoundError(
+                f"OpenSMILE scaler not found: {opensmile_scaler_path}"
+            )
+
+        opensmile_scaler = joblib.load(opensmile_scaler_path)
+
+        if len(opensmile_scaler.mean_) != audio_feature_dim:
+            raise ValueError(
+                f"Scaler dimension is {len(opensmile_scaler.mean_)}, "
+                f"but expected {audio_feature_dim}."
+            )
+
+        # Store scaler statistics as fixed torch buffers.
+        # This lets preprocessing run on the same device as the model.
+        self.register_buffer(
+            "opensmile_mean",
+            torch.tensor(
+                opensmile_scaler.mean_,
+                dtype=torch.float32,
+            ),
+            persistent=True,
+        )
+
+        self.register_buffer(
+            "opensmile_scale",
+            torch.tensor(
+                opensmile_scaler.scale_,
+                dtype=torch.float32,
+            ),
+            persistent=True,
+        )
+
+        # ==================================================
+        # Trainable audio query adapter
+        # ==================================================
+        #
+        # This adapter transforms only the input audio feature.
+        # The fixed audio dictionary is never transformed.
+        #
+        # Input:  processed OpenSMILE feature [B, 88]
+        # Output: adapted query feature [B, 88]
+
+        self.audio_adapter = nn.Sequential(
+            nn.LayerNorm(88),
+            nn.Linear(88, clf_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(clf_hidden, 88),
+        )
+
+        # Initialize with a small residual contribution.
+        # This prevents the adapter from immediately destroying
+        # the original OpenSMILE geometry.
+        self.audio_adapter_scale = nn.Parameter(
+            torch.tensor(0.1, dtype=torch.float32)
+        )
+
+        fusion_similarity_dim = num_aus + self.num_audio_atoms
+
+        self.au_audio_classifier = nn.Sequential(
+            # nn.LayerNorm(fusion_similarity_dim),
+            nn.Linear(self.num_audio_atoms, clf_hidden), # fusion_similarity_dim
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(clf_hidden, num_classes),
+        )
+
+        # audio starts with very small influence
+        self.audio_fusion_alpha = nn.Parameter(torch.tensor(1.0))
+
+
+        align_dim = 128
+
+        self.visual_align_proj = nn.Sequential(
+            nn.Linear(512, align_dim),          # 46 -> 128
+            nn.GELU(),
+            nn.Linear(align_dim, align_dim),
+        )
+
+        self.audio_align_proj = nn.Sequential(
+            nn.Linear(88, align_dim),  # K -> 128
+            nn.GELU(),
+            nn.Linear(align_dim, align_dim),
+        )
+
+        self.subject_fusion_delta = nn.Parameter(
+            torch.zeros(())
+        )
 
 
     def visualize_au_text_embeddings(self, video, au_prompts, adapt_tar, key_frame_sel, key_frames, device="cuda"):
@@ -1550,19 +1738,2700 @@ class ClipTestTimeVideoTuning(nn.Module):
 
         return selected_idx
 
-    def temporal_clip_au_forward(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=False, key_frame_sel=False, train_whole_clip=False, key_frames=16):
+    @torch.no_grad()
+    def extract_opensmile_batch(
+        self,
+        audio_arr: torch.Tensor,
+        sample_rate: int | None = None,
+    ) -> torch.Tensor:
         """
-        Process Audio
+        Extract processed OpenSMILE features for a batch of audio waveforms.
 
+        Args:
+            audio_arr:
+                Batched mono waveforms with shape [N, T].
+                Example: [N, 240000].
+
+            sample_rate:
+                Sampling rate of the waveforms. Defaults to
+                self.audio_sample_rate.
+
+        Returns:
+            base_audio_embeds:
+                Processed OpenSMILE features with shape [N, 88].
+
+                Processing:
+                    waveform
+                    -> OpenSMILE eGeMAPSv02
+                    -> source-domain standardization
+                    -> optional activation threshold
+                    -> L2 normalization
         """
-        # inputs = self.audio_fe(audio, sampling_rate=16000, return_tensors="pt")
-        # Check the last dimension (temporal length)
-        if audio.shape[-1] < 100:
-            print(f"Audio shape {audio.shape} is too short!")
-        base_audio_embeds = self.audio_model(audio)  # (B, 1024)
-        audio_embeds = self.audio_adapter(base_audio_embeds)  # (B, 512)
-        audio_embeds_norm = F.normalize(audio_embeds, dim=-1)
-        
+
+        if sample_rate is None:
+            sample_rate = self.audio_sample_rate
+
+        if not isinstance(audio_arr, torch.Tensor):
+            raise TypeError(
+                f"audio_arr must be a torch.Tensor, got {type(audio_arr)}"
+            )
+
+        # Allow one waveform [T] by adding a batch dimension.
+        if audio_arr.ndim == 1:
+            audio_arr = audio_arr.unsqueeze(0)
+
+        if audio_arr.ndim != 2:
+            raise ValueError(
+                "Expected audio_arr with shape [N, T], "
+                f"but received {tuple(audio_arr.shape)}"
+            )
+
+        batch_size, num_samples = audio_arr.shape
+
+        if num_samples == 0:
+            raise ValueError("Received an empty audio waveform.")
+
+        # OpenSMILE runs on CPU/NumPy.
+        audio_np = (
+            audio_arr
+            .detach()
+            .to(dtype=torch.float32, device="cpu")
+            .numpy()
+        )
+
+        raw_feature_list = []
+
+        for batch_idx in range(batch_size):
+            waveform = audio_np[batch_idx]
+
+            waveform = np.nan_to_num(
+                waveform,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32, copy=False)
+
+            # OpenSMILE expects one mono waveform with shape [T].
+            feature_df = self.opensmile_model.process_signal(
+                waveform,
+                sample_rate,
+            )
+
+            feature = (
+                feature_df
+                .to_numpy(dtype=np.float32)
+                .reshape(-1)
+            )
+
+            if feature.shape[0] != self.audio_feature_dim:
+                raise RuntimeError(
+                    f"OpenSMILE returned {feature.shape[0]} features "
+                    f"for sample {batch_idx}, but expected "
+                    f"{self.audio_feature_dim}."
+                )
+
+            feature = np.nan_to_num(
+                feature,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            raw_feature_list.append(feature)
+
+        # [N, 88]
+        raw_features = np.stack(
+            raw_feature_list,
+            axis=0,
+        )
+
+        # Move features to the same device as the fixed dictionary.
+        raw_features = torch.from_numpy(raw_features).to(
+            device=self.opensmile_mean.device,
+            dtype=torch.float32,
+        )
+
+        # Apply the exact source-domain scaler used to create the dictionary.
+        base_audio_embeds = (
+            raw_features - self.opensmile_mean.unsqueeze(0)
+        ) / self.opensmile_scale.unsqueeze(0).clamp_min(1e-8)
+
+        # Apply the same activation threshold used during dictionary creation.
+        # # threshold=0.0 means all features are retained.
+        # if self.activation_threshold > 0.0:
+        #     if self.positive_only:
+        #         activation_mask = (
+        #             base_audio_embeds >= self.activation_threshold
+        #         )
+        #     else:
+        #         activation_mask = (
+        #             base_audio_embeds.abs() >= self.activation_threshold
+        #         )
+
+        #     base_audio_embeds = torch.where(
+        #         activation_mask,
+        #         base_audio_embeds,
+        #         torch.zeros_like(base_audio_embeds),
+        #     )
+
+        # Match the normalized feature space used by the dictionary.
+        base_audio_embeds = F.normalize(
+            base_audio_embeds,
+            p=2,
+            dim=-1,
+            eps=1e-8,
+        )
+
+        return base_audio_embeds
+
+    def audio_similarity_to_class_logits(self, audio_similarity, reduce="max",):
+        """
+        Convert audio dictionary similarity [B, K]
+        into class logits [B, num_classes] using fixed dictionary labels.
+        """
+
+        B = audio_similarity.shape[0]
+
+        audio_class_logits = []
+
+        for class_id in range(self.num_classes):
+            mask = self.audio_cluster_labels == class_id
+
+            if mask.sum() == 0:
+                class_score = torch.full(
+                    (B,),
+                    -1e4,
+                    device=audio_similarity.device,
+                    dtype=audio_similarity.dtype,
+                )
+            else:
+                class_sims = audio_similarity[:, mask]
+
+                if reduce == "max":
+                    class_score = class_sims.max(dim=1).values
+                elif reduce == "mean":
+                    class_score = class_sims.mean(dim=1)
+                elif reduce == "logsumexp":
+                    class_score = torch.logsumexp(class_sims, dim=1)
+                else:
+                    raise ValueError(f"Unknown reduce: {reduce}")
+
+            audio_class_logits.append(class_score)
+
+        audio_class_logits = torch.stack(
+            audio_class_logits,
+            dim=1,
+        )  # [B, num_classes]
+
+        return audio_class_logits
+
+    def compute_audio_dictionary_similarity(self, processed_opensmile_features):
+        """
+        Compute cosine similarity with the unchanged audio dictionary.
+
+        Args:
+            processed_opensmile_features:
+                Tensor [B, 88].
+
+                These features must already use the same:
+                    - source StandardScaler,
+                    - activation threshold,
+                    - L2 processing
+
+                used when constructing the dictionary.
+
+        Returns:
+            audio_similarity:
+                Tensor [B, N], where N is the number of dictionary atoms.
+        """
+
+        if processed_opensmile_features.ndim == 1:
+            processed_opensmile_features = (
+                processed_opensmile_features.unsqueeze(0)
+            )
+
+        if processed_opensmile_features.shape[-1] != self.audio_feature_dim:
+            raise ValueError(
+                f"Expected audio feature dimension {self.audio_feature_dim}, "
+                f"but received {processed_opensmile_features.shape[-1]}."
+            )
+
+        # OpenSMILE features are fixed, so no gradient is required here.
+        audio_features = processed_opensmile_features.detach().float()
+
+        audio_features = F.normalize(
+            audio_features,
+            p=2,
+            dim=-1,
+        )
+
+        # audio_dictionary is a fixed registered buffer [N, 88].
+        audio_similarity = (
+            audio_features @ self.audio_dictionary.T
+        )
+
+        return audio_similarity
+    
+    @torch.no_grad()
+    def normalized_entropy(prob, eps=1e-8):
+        """
+        prob: [B, C]
+
+        Returns:
+            entropy: [B]
+            0 = confident
+            1 = uncertain
+        """
+        entropy = -(
+            prob * torch.log(prob.clamp_min(eps))
+        ).sum(dim=-1)
+
+        return entropy / math.log(prob.shape[-1])
+    @torch.no_grad()
+    def estimate_subject_modality_weights(self,
+        visual_prob_all,
+        audio_prob_all,
+        eps=1e-8,
+        weight_temperature=0.2,
+    ):
+        """
+        Estimate one visual and audio weight for a target subject.
+
+        Returns:
+            visual_weight: scalar
+            audio_weight: scalar
+        """
+        visual_entropy = -(
+            visual_prob_all * torch.log(visual_prob_all.clamp_min(eps))
+        ).sum(dim=-1)
+        visual_entropy = (visual_entropy / math.log(visual_prob_all.shape[-1])).mean()
+
+        # visual_entropy = self.normalized_entropy(
+        #     visual_prob_all
+        # ).mean()
+
+        audio_entropy = -(
+            audio_prob_all * torch.log(audio_prob_all.clamp_min(eps))
+        ).sum(dim=-1)
+        audio_entropy = (audio_entropy / math.log(audio_prob_all.shape[-1])).mean()
+
+        # audio_entropy = self.normalized_entropy(
+        #     audio_prob_all
+        # ).mean()
+
+        # Negative entropy is used as a confidence score.
+        confidence_scores = torch.stack(
+            [
+                -visual_entropy,
+                -audio_entropy,
+            ],
+            dim=-1,
+        )  # [B, 2]
+
+        modality_weights = F.softmax(
+            confidence_scores / weight_temperature,
+            dim=-1,
+        )
+
+        visual_weight = modality_weights[0]
+        audio_weight = modality_weights[1]
+
+        fused_prob = (
+            visual_weight * visual_prob_all
+            + audio_weight * audio_prob_all
+        )
+
+        return {
+            "fused_prob": fused_prob,
+            "visual_weight": visual_weight,
+            "audio_weight": audio_weight,
+            "visual_entropy": visual_entropy,
+            "audio_entropy": audio_entropy,
+        }
+
+
+
+    def certainty_aware_fusion(self,
+        visual_prob,
+        audio_prob,
+        base_visual_weight=0.5,
+        base_audio_weight=0.5,
+        confidence_threshold=0.80,
+        boost_strength=3.0,
+        eps=1e-8,
+    ):
+        """
+        Args:
+            visual_prob:
+                Visual class probabilities, shape [C] or [B, C].
+
+            audio_prob:
+                Audio class probabilities, shape [C] or [B, C].
+
+            base_visual_weight:
+                Default visual modality weight.
+
+            base_audio_weight:
+                Default audio modality weight.
+
+            confidence_threshold:
+                A modality is boosted only if its maximum probability
+                exceeds this threshold.
+
+            boost_strength:
+                Controls how strongly a confident modality is boosted.
+
+        Returns:
+            fused_prob:
+                Fused class probabilities.
+
+            visual_weight:
+                Final visual weight.
+
+            audio_weight:
+                Final audio weight.
+        """
+
+        if visual_prob.ndim == 1:
+            visual_prob = visual_prob.unsqueeze(0)
+
+        if audio_prob.ndim == 1:
+            audio_prob = audio_prob.unsqueeze(0)
+
+        # Maximum class probability for each modality
+        visual_confidence = visual_prob.max(
+            dim=-1
+        ).values
+
+        audio_confidence = audio_prob.max(
+            dim=-1
+        ).values
+
+        # Confidence above the threshold, normalized to [0, 1]
+        visual_excess = (
+            (
+                visual_confidence
+                - confidence_threshold
+            )
+            / (1.0 - confidence_threshold)
+        ).clamp(0.0, 1.0)
+
+        audio_excess = (
+            (
+                audio_confidence
+                - confidence_threshold
+            )
+            / (1.0 - confidence_threshold)
+        ).clamp(0.0, 1.0)
+
+        # Start from the generic/default modality weights
+        base_log_weights = torch.tensor(
+            [
+                base_visual_weight,
+                base_audio_weight,
+            ],
+            device=visual_prob.device,
+            dtype=visual_prob.dtype,
+        ).clamp_min(eps).log()
+
+        # Add a boost only when confidence exceeds the threshold
+        modality_scores = torch.stack(
+            [
+                base_log_weights[0]
+                + boost_strength * visual_excess,
+
+                base_log_weights[1]
+                + boost_strength * audio_excess,
+            ],
+            dim=-1,
+        )
+
+        modality_weights = F.softmax(
+            modality_scores,
+            dim=-1,
+        )
+
+        visual_weight = modality_weights[:, 0:1]
+        audio_weight = modality_weights[:, 1:2]
+
+        fused_prob = (
+            visual_weight * visual_prob
+            + audio_weight * audio_prob
+        )
+
+        return {
+            "fused_prob": fused_prob,
+            "visual_weight": visual_weight,
+            "audio_weight": audio_weight,
+            "visual_confidence": visual_confidence,
+            "audio_confidence": audio_confidence,
+    }
+
+
+
+    def entropy_confidence(self, prob: torch.Tensor, eps: float = 1e-8):
+        """
+        Convert class probabilities into normalized confidence.
+
+        Args:
+            prob: [C] or [B, C]
+
+        Returns:
+            confidence: [B]
+                0 = maximally uncertain
+                1 = maximally confident
+        """
+        if prob.ndim == 1:
+            prob = prob.unsqueeze(0)
+
+        prob = prob.clamp_min(eps)
+        prob = prob / prob.sum(dim=-1, keepdim=True)
+
+        entropy = -(
+            prob * torch.log(prob)
+        ).sum(dim=-1)
+
+        max_entropy = math.log(prob.shape[-1])
+
+        confidence = 1.0 - entropy / max_entropy
+
+        return confidence
+
+
+    def conservative_confidence_fusion(self,
+        visual_prob: torch.Tensor,
+        audio_prob: torch.Tensor,
+        base_audio_weight: float = 0.72,
+        min_audio_weight: float = 0.60,
+        max_audio_weight: float = 0.90,
+        high_confidence: float = 0.75,
+        audio_margin: float = 0.10,
+        visual_margin: float = 0.15,
+    ):
+        """
+        Audio-dominant fusion with bounded confidence-based corrections.
+
+        The generic audio weight is preserved unless one modality provides
+        sufficiently strong evidence.
+
+        Args:
+            visual_prob: [C] or [B, C]
+            audio_prob:  [C] or [B, C]
+
+        Returns:
+            Dictionary containing fused probabilities, modality weights,
+            confidence values, and predictions.
+        """
+
+        if visual_prob.ndim == 1:
+            visual_prob = visual_prob.unsqueeze(0)
+
+        if audio_prob.ndim == 1:
+            audio_prob = audio_prob.unsqueeze(0)
+
+        visual_confidence = self.entropy_confidence(
+            visual_prob
+        )
+
+        audio_confidence = self.entropy_confidence(
+            audio_prob
+        )
+
+        visual_prediction = visual_prob.argmax(dim=-1)
+        audio_prediction = audio_prob.argmax(dim=-1)
+
+        disagreement = (
+            visual_prediction != audio_prediction
+        )
+
+        # Positive means audio is more confident.
+        confidence_gap = (
+            audio_confidence - visual_confidence
+        )
+
+        audio_weight = torch.full_like(
+            audio_confidence,
+            fill_value=base_audio_weight,
+        )
+
+        # --------------------------------------------------
+        # Increase audio weight only when audio is clearly
+        # more reliable and visual is not highly confident.
+        # --------------------------------------------------
+        audio_override = (
+            disagreement
+            & (audio_confidence >= high_confidence)
+            & (visual_confidence < high_confidence)
+            & (confidence_gap >= audio_margin)
+        )
+
+        audio_strength = (
+            (confidence_gap - audio_margin)
+            / (1.0 - audio_margin)
+        ).clamp(0.0, 1.0)
+
+        audio_adjustment = (
+            max_audio_weight - base_audio_weight
+        ) * audio_strength
+
+        audio_weight = torch.where(
+            audio_override,
+            audio_weight + audio_adjustment,
+            audio_weight,
+        )
+
+        # --------------------------------------------------
+        # Increase visual influence only when visual is
+        # clearly more reliable and audio is uncertain.
+        # --------------------------------------------------
+        visual_override = (
+            disagreement
+            & (visual_confidence >= high_confidence)
+            & (audio_confidence < high_confidence)
+            & (-confidence_gap >= visual_margin)
+        )
+
+        visual_strength = (
+            (-confidence_gap - visual_margin)
+            / (1.0 - visual_margin)
+        ).clamp(0.0, 1.0)
+
+        visual_adjustment = (
+            base_audio_weight - min_audio_weight
+        ) * visual_strength
+
+        audio_weight = torch.where(
+            visual_override,
+            audio_weight - visual_adjustment,
+            audio_weight,
+        )
+
+        audio_weight = audio_weight.clamp(
+            min=min_audio_weight,
+            max=max_audio_weight,
+        )
+
+        visual_weight = 1.0 - audio_weight
+
+        visual_weight = visual_weight.unsqueeze(-1)
+        audio_weight = audio_weight.unsqueeze(-1)
+
+        fused_prob = (
+            visual_weight * visual_prob
+            + audio_weight * audio_prob
+        )
+
+        return {
+            "fused_prob": fused_prob,
+            "visual_weight": visual_weight,
+            "audio_weight": audio_weight,
+            "visual_confidence": visual_confidence,
+            "audio_confidence": audio_confidence,
+            "visual_prediction": visual_prediction,
+            "audio_prediction": audio_prediction,
+            "disagreement": disagreement,
+        }
+
+
+    def crop_synchronized_audio(self,
+        audio: torch.Tensor,
+        total_frames: int,
+        window_start: int,
+        window_size: int,
+    ):
+        """
+        audio: [B, num_samples]
+        total_frames: total visual frames, e.g. 30
+        window_start: selected visual-window start index
+        window_size: selected number of frames
+        """
+        window_end = min(
+            window_start + window_size,
+            total_frames,
+        )
+
+        num_samples = audio.shape[-1]
+
+        start_sample = round(
+            window_start / total_frames * num_samples
+        )
+
+        end_sample = round(
+            window_end / total_frames * num_samples
+        )
+
+        return audio[..., start_sample:end_sample]
+
+
+    def select_key_consec_frames_multimodal(
+        self,
+        video_feats,
+        audio,
+        adapted_embeds,
+        top_k=16,
+        sample_rate=16000,
+        visual_temp=1.0,
+        audio_temp=0.2,
+        visual_selection_weight=0.5,
+        audio_selection_weight=0.5,
+    ):
+        """
+        Select the best synchronized visual-audio consecutive window.
+
+        Selection criteria:
+            1. Low visual entropy relative to other visual windows.
+            2. Low audio entropy relative to other audio windows.
+            3. Prefer windows where visual and audio predict the same class.
+
+        Args:
+            video_feats:
+                CLIP visual features for all frames.
+                Shape: [T, D]
+
+            audio:
+                Complete waveform synchronized with all T frames.
+                Shape: [1, num_audio_samples] or [num_audio_samples]
+
+            adapted_embeds:
+                Adapted AU text embeddings.
+                Shape: [num_AUs, D]
+
+            top_k:
+                Number of consecutive frames in each candidate window.
+
+            sample_rate:
+                Audio sample rate used by OpenSMILE.
+
+            visual_temp:
+                Temperature applied to visual logits.
+
+            audio_temp:
+                Temperature applied to audio dictionary class scores.
+
+            visual_selection_weight:
+                Contribution of visual rank to window selection.
+
+            audio_selection_weight:
+                Contribution of audio rank to window selection.
+
+        Required class attributes:
+            self.temporal
+            self.temporal_classifier
+            self.extract_opensmile_batch
+            self.audio_dictionary
+            self.audio_dictionary_labels
+
+        Returns:
+            Dictionary containing selected visual indices, synchronized audio,
+            probabilities, entropies, ranks, and diagnostic information.
+        """
+
+        # ---------------------------------------------------------
+        # Validate input shapes
+        # ---------------------------------------------------------
+        if video_feats.ndim != 2:
+            raise ValueError(
+                "video_feats must have shape [T, D], "
+                f"but received {tuple(video_feats.shape)}."
+            )
+
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+
+        if audio.ndim != 2:
+            raise ValueError(
+                "audio must have shape [1, S] or [S], "
+                f"but received {tuple(audio.shape)}."
+            )
+
+        if audio.shape[0] != 1:
+            raise ValueError(
+                "This function expects one sample at a time. "
+                f"Received audio batch size {audio.shape[0]}."
+            )
+
+        if adapted_embeds.ndim != 2:
+            raise ValueError(
+                "adapted_embeds must have shape [num_AUs, D], "
+                f"but received {tuple(adapted_embeds.shape)}."
+            )
+
+        T = video_feats.shape[0]
+
+        if T == 0:
+            raise ValueError("video_feats contains no frames.")
+
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        # If the sequence is shorter than top_k, use the whole sequence.
+        top_k = min(top_k, T)
+
+        number_of_windows = T - top_k + 1
+        num_audio_samples = audio.shape[-1]
+
+        # ---------------------------------------------------------
+        # Normalize selection weights
+        # ---------------------------------------------------------
+        selection_weight_sum = (
+            visual_selection_weight
+            + audio_selection_weight
+        )
+
+        if selection_weight_sum <= 0:
+            raise ValueError(
+                "The sum of visual_selection_weight and "
+                "audio_selection_weight must be positive."
+            )
+
+        visual_selection_weight = (
+            visual_selection_weight
+            / selection_weight_sum
+        )
+
+        audio_selection_weight = (
+            audio_selection_weight
+            / selection_weight_sum
+        )
+
+        # ---------------------------------------------------------
+        # Prepare fixed dictionary information
+        # ---------------------------------------------------------
+        audio_dictionary = self.audio_dictionary
+
+        if audio_dictionary.ndim != 2:
+            raise ValueError(
+                "self.audio_dictionary must have shape [K, audio_dim], "
+                f"but received {tuple(audio_dictionary.shape)}."
+            )
+
+        audio_dictionary = audio_dictionary.to(
+            device=video_feats.device,
+            dtype=video_feats.dtype,
+        )
+
+        audio_dictionary_norm = F.normalize(
+            audio_dictionary,
+            dim=-1,
+        )
+
+        audio_dictionary_labels = (
+            self.audio_cluster_labels
+            .to(video_feats.device)
+            .long()
+        )
+
+        if audio_dictionary_labels.ndim != 1:
+            raise ValueError(
+                "self.audio_dictionary_labels must have shape [K]."
+            )
+
+        if (
+            audio_dictionary_labels.shape[0]
+            != audio_dictionary.shape[0]
+        ):
+            raise ValueError(
+                "The number of audio dictionary labels must match "
+                "the number of dictionary atoms."
+            )
+
+        adapted_embeds_norm = F.normalize(
+            adapted_embeds,
+            dim=-1,
+        )
+
+        visual_probs_list = []
+        audio_probs_list = []
+
+        visual_entropies_list = []
+        audio_entropies_list = []
+
+        audio_start_samples = []
+        audio_end_samples = []
+
+        # Window selection is discrete, so there is no reason to retain
+        # gradients through every candidate window.
+        with torch.no_grad():
+
+            for start_idx in range(number_of_windows):
+
+                end_idx = start_idx + top_k
+
+                # =====================================================
+                # 1. Visual branch
+                # =====================================================
+
+                window_feats = video_feats[
+                    start_idx:end_idx
+                ]  # [top_k, D]
+
+                window_feats_batch = window_feats.unsqueeze(
+                    0
+                )  # [1, top_k, D]
+
+                # Temporal module expects [B, D, T].
+                temporal_features = self.temporal(
+                    window_feats_batch.transpose(1, 2)
+                )
+
+                temporal_features = F.gelu(
+                    temporal_features
+                )
+
+                # Aggregate temporally.
+                visual_embeds = temporal_features.mean(
+                    dim=-1
+                )  # [1, D]
+
+                visual_embeds = F.normalize(
+                    visual_embeds,
+                    dim=-1,
+                )
+
+                # AU similarities.
+                au_similarity = (
+                    visual_embeds
+                    @ adapted_embeds_norm.T
+                )  # [1, num_AUs]
+
+                visual_logits = self.temporal_classifier(
+                    au_similarity
+                )  # [1, num_classes]
+
+                visual_prob = F.softmax(
+                    visual_logits / visual_temp,
+                    dim=-1,
+                )
+
+                num_classes = visual_prob.shape[-1]
+
+                visual_entropy = -(
+                    visual_prob
+                    * torch.log(
+                        visual_prob.clamp_min(1e-8)
+                    )
+                ).sum(dim=-1)
+
+                visual_entropy = (
+                    visual_entropy
+                    / math.log(num_classes)
+                )
+
+                # =====================================================
+                # 2. Crop synchronized audio
+                # =====================================================
+
+                # The complete waveform corresponds exactly to all T
+                # visual frames, so crop it proportionally.
+                start_sample = round(
+                    start_idx
+                    / T
+                    * num_audio_samples
+                )
+
+                end_sample = round(
+                    end_idx
+                    / T
+                    * num_audio_samples
+                )
+
+                start_sample = max(
+                    0,
+                    min(
+                        start_sample,
+                        num_audio_samples - 1,
+                    ),
+                )
+
+                end_sample = max(
+                    start_sample + 1,
+                    min(
+                        end_sample,
+                        num_audio_samples,
+                    ),
+                )
+
+                audio_window = audio[
+                    :,
+                    start_sample:end_sample,
+                ]
+
+                # =====================================================
+                # 3. OpenSMILE audio embedding
+                # =====================================================
+
+                audio_embeds_norm = (
+                    self.extract_opensmile_batch(
+                        audio_window,
+                        sample_rate=sample_rate,
+                    )
+                )  # [1, audio_dim]
+
+                audio_embeds_norm = audio_embeds_norm.to(
+                    device=audio_dictionary_norm.device,
+                    dtype=audio_dictionary_norm.dtype,
+                )
+
+                # Safe even when extract_opensmile_batch already performs
+                # L2 normalization.
+                audio_embeds_norm = F.normalize(
+                    audio_embeds_norm,
+                    dim=-1,
+                )
+
+                if (
+                    audio_embeds_norm.shape[-1]
+                    != audio_dictionary_norm.shape[-1]
+                ):
+                    raise ValueError(
+                        "OpenSMILE embedding dimension does not match "
+                        "the audio dictionary dimension. Received "
+                        f"{audio_embeds_norm.shape[-1]} and "
+                        f"{audio_dictionary_norm.shape[-1]}."
+                    )
+
+                # =====================================================
+                # 4. Audio dictionary similarity
+                # =====================================================
+
+                audio_similarity = (
+                    audio_embeds_norm
+                    @ audio_dictionary_norm.T
+                )  # [1, K]
+
+                # Convert dictionary-atom similarities to class scores.
+                audio_class_scores = torch.full(
+                    (
+                        audio_similarity.shape[0],
+                        num_classes,
+                    ),
+                    fill_value=-1e4,
+                    device=audio_similarity.device,
+                    dtype=audio_similarity.dtype,
+                )
+
+                for class_idx in range(num_classes):
+
+                    class_mask = (
+                        audio_dictionary_labels
+                        == class_idx
+                    )
+
+                    if class_mask.any():
+                        # Nearest dictionary atom belonging to this class.
+                        audio_class_scores[
+                            :,
+                            class_idx,
+                        ] = (
+                            audio_similarity[
+                                :,
+                                class_mask,
+                            ]
+                            .max(dim=-1)
+                            .values
+                        )
+
+                audio_prob = F.softmax(
+                    audio_class_scores / audio_temp,
+                    dim=-1,
+                )
+
+                audio_entropy = -(
+                    audio_prob
+                    * torch.log(
+                        audio_prob.clamp_min(1e-8)
+                    )
+                ).sum(dim=-1)
+
+                audio_entropy = (
+                    audio_entropy
+                    / math.log(num_classes)
+                )
+
+                # =====================================================
+                # 5. Store candidate-window information
+                # =====================================================
+
+                visual_probs_list.append(
+                    visual_prob.squeeze(0)
+                )
+
+                audio_probs_list.append(
+                    audio_prob.squeeze(0)
+                )
+
+                visual_entropies_list.append(
+                    visual_entropy.squeeze(0)
+                )
+
+                audio_entropies_list.append(
+                    audio_entropy.squeeze(0)
+                )
+
+                audio_start_samples.append(
+                    start_sample
+                )
+
+                audio_end_samples.append(
+                    end_sample
+                )
+
+            # ---------------------------------------------------------
+            # Stack results from all candidate windows
+            # ---------------------------------------------------------
+            visual_window_probs = torch.stack(
+                visual_probs_list,
+                dim=0,
+            )  # [W, C]
+
+            audio_window_probs = torch.stack(
+                audio_probs_list,
+                dim=0,
+            )  # [W, C]
+
+            visual_entropies = torch.stack(
+                visual_entropies_list,
+                dim=0,
+            )  # [W]
+
+            audio_entropies = torch.stack(
+                audio_entropies_list,
+                dim=0,
+            )  # [W]
+
+            # ---------------------------------------------------------
+            # Rank windows independently for each modality
+            # ---------------------------------------------------------
+            visual_order = torch.argsort(
+                visual_entropies
+            )
+
+            audio_order = torch.argsort(
+                audio_entropies
+            )
+
+            visual_ranks = torch.empty(
+                number_of_windows,
+                device=visual_entropies.device,
+                dtype=torch.float32,
+            )
+
+            audio_ranks = torch.empty(
+                number_of_windows,
+                device=audio_entropies.device,
+                dtype=torch.float32,
+            )
+
+            visual_ranks[visual_order] = torch.arange(
+                number_of_windows,
+                device=visual_entropies.device,
+                dtype=torch.float32,
+            )
+
+            audio_ranks[audio_order] = torch.arange(
+                number_of_windows,
+                device=audio_entropies.device,
+                dtype=torch.float32,
+            )
+
+            # Normalize ranks to [0, 1].
+            rank_denominator = max(
+                number_of_windows - 1,
+                1,
+            )
+
+            visual_ranks = (
+                visual_ranks / rank_denominator
+            )
+
+            audio_ranks = (
+                audio_ranks / rank_denominator
+            )
+
+            # Lower combined rank is better.
+            combined_rank = (
+                visual_selection_weight
+                * visual_ranks
+                + audio_selection_weight
+                * audio_ranks
+            )
+
+            # ---------------------------------------------------------
+            # Prefer windows where both modalities predict same class
+            # ---------------------------------------------------------
+            visual_predictions = (
+                visual_window_probs.argmax(dim=-1)
+            )
+
+            audio_predictions = (
+                audio_window_probs.argmax(dim=-1)
+            )
+
+            agreement = (
+                visual_predictions
+                == audio_predictions
+            )
+
+            if agreement.any():
+                # Among agreeing windows, select the one with the best
+                # combined visual/audio rank.
+                selection_scores = combined_rank.masked_fill(
+                    ~agreement,
+                    float("inf"),
+                )
+
+                used_agreement_fallback = False
+
+            else:
+                # No candidate window has modality agreement.
+                # Select the best combined-rank window.
+                selection_scores = combined_rank
+
+                used_agreement_fallback = True
+
+            selected_start = int(
+                selection_scores.argmin().item()
+            )
+
+        # -------------------------------------------------------------
+        # Construct selected synchronized pair
+        # -------------------------------------------------------------
+        selected_end = selected_start + top_k
+
+        selected_idx = list(
+            range(
+                selected_start,
+                selected_end,
+            )
+        )
+
+        selected_audio_start = audio_start_samples[
+            selected_start
+        ]
+
+        selected_audio_end = audio_end_samples[
+            selected_start
+        ]
+
+        selected_audio = audio[
+            :,
+            selected_audio_start:selected_audio_end,
+        ]
+
+        selected_video_feats = video_feats[
+            selected_start:selected_end
+        ]
+
+        return {
+            "selected_idx": selected_idx,
+            "selected_start": selected_start,
+            "selected_end": selected_end,
+
+            "selected_video_feats": selected_video_feats,
+            "selected_audio": selected_audio,
+
+            "selected_audio_start": selected_audio_start,
+            "selected_audio_end": selected_audio_end,
+
+            "selected_visual_prob": (
+                visual_window_probs[
+                    selected_start:selected_start + 1
+                ]
+            ),
+
+            "selected_audio_prob": (
+                audio_window_probs[
+                    selected_start:selected_start + 1
+                ]
+            ),
+
+            "selected_visual_entropy": (
+                visual_entropies[selected_start]
+            ),
+
+            "selected_audio_entropy": (
+                audio_entropies[selected_start]
+            ),
+
+            "selected_visual_prediction": (
+                visual_predictions[selected_start]
+            ),
+
+            "selected_audio_prediction": (
+                audio_predictions[selected_start]
+            ),
+
+            "selected_modalities_agree": (
+                agreement[selected_start]
+            ),
+
+            "used_agreement_fallback": (
+                used_agreement_fallback
+            ),
+
+            # All candidate-window diagnostics
+            "visual_window_probs": visual_window_probs,
+            "audio_window_probs": audio_window_probs,
+
+            "visual_entropies": visual_entropies,
+            "audio_entropies": audio_entropies,
+
+            "visual_ranks": visual_ranks,
+            "audio_ranks": audio_ranks,
+            "combined_rank": combined_rank,
+
+            "visual_predictions": visual_predictions,
+            "audio_predictions": audio_predictions,
+
+            "agreement": agreement,
+            "selection_scores": selection_scores,
+        }
+
+
+    def select_key_consec_frames_audio_guided(
+        self,
+        video_feats,
+        audio,
+        adapted_embeds,
+        top_k=16,
+        sample_rate=16000,
+        visual_temp=1.0,
+        audio_temp=0.2,
+        audio_guidance_strength=0.10,
+        audio_atom_reduction="max",
+        audio_atom_topk=2,
+        audio_atom_temperature=0.1,
+    ):
+        """
+        Select the most informative consecutive visual window using:
+
+            selection_score =
+                visual_entropy
+                + audio_guidance_strength * visual_audio_JS_divergence
+
+        The complete audio waveform is processed once. Its prediction softly
+        guides selection among the candidate visual windows.
+
+        Audio dictionary atoms assigned to the same class can be aggregated
+        using max, mean, top-k mean, or a softmax-weighted mean.
+
+        Args:
+            video_feats:
+                Frame-level visual features.
+                Shape: [T, D]
+
+            audio:
+                Complete waveform synchronized with the T visual frames.
+                Shape: [1, S] or [S]
+
+            adapted_embeds:
+                Adapted AU text embeddings.
+                Shape: [num_AUs, D]
+
+            top_k:
+                Number of consecutive visual frames to select.
+
+            sample_rate:
+                Audio sample rate used by OpenSMILE.
+
+            visual_temp:
+                Temperature applied to visual logits.
+
+            audio_temp:
+                Temperature applied to final audio class scores.
+
+            audio_guidance_strength:
+                Strength of audio guidance during window selection.
+
+                0.0:
+                    Original visual-only entropy selection.
+
+                0.10:
+                    Weak audio guidance.
+
+                0.25:
+                    Moderate audio guidance.
+
+                0.50:
+                    Strong audio guidance.
+
+            audio_atom_reduction:
+                Method used to aggregate similarities from dictionary atoms
+                belonging to the same class.
+
+                "max":
+                    Use the most similar atom.
+
+                "mean":
+                    Average all atoms belonging to the class.
+
+                "topk_mean":
+                    Average the top audio_atom_topk most similar atoms.
+
+                "softmax":
+                    Compute a similarity-weighted average of all atoms.
+
+            audio_atom_topk:
+                Number of atoms used by "topk_mean".
+
+            audio_atom_temperature:
+                Temperature used by "softmax" atom aggregation.
+
+                Smaller values:
+                    More similar to max aggregation.
+
+                Larger values:
+                    More uniform contribution from all class atoms.
+
+        Required class attributes:
+            self.temporal
+            self.temporal_classifier
+            self.extract_opensmile_batch
+            self.audio_dictionary
+            self.audio_cluster_labels
+
+        Returns:
+            Dictionary containing selected indices, visual features,
+            synchronized audio, probabilities, class scores, entropies,
+            JS divergences, and selection diagnostics.
+        """
+
+        # =============================================================
+        # 1. Validate inputs
+        # =============================================================
+        if video_feats.ndim != 2:
+            raise ValueError(
+                "video_feats must have shape [T, D], "
+                f"but received {tuple(video_feats.shape)}."
+            )
+
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+
+        if audio.ndim != 2:
+            raise ValueError(
+                "audio must have shape [1, S] or [S], "
+                f"but received {tuple(audio.shape)}."
+            )
+
+        if audio.shape[0] != 1:
+            raise ValueError(
+                "This function expects one audio sample at a time, "
+                f"but received batch size {audio.shape[0]}."
+            )
+
+        if adapted_embeds.ndim != 2:
+            raise ValueError(
+                "adapted_embeds must have shape [num_AUs, D], "
+                f"but received {tuple(adapted_embeds.shape)}."
+            )
+
+        if visual_temp <= 0:
+            raise ValueError(
+                "visual_temp must be greater than zero."
+            )
+
+        if audio_temp <= 0:
+            raise ValueError(
+                "audio_temp must be greater than zero."
+            )
+
+        if audio_guidance_strength < 0:
+            raise ValueError(
+                "audio_guidance_strength cannot be negative."
+            )
+
+        valid_reductions = {
+            "max",
+            "mean",
+            "topk_mean",
+            "softmax",
+        }
+
+        if audio_atom_reduction not in valid_reductions:
+            raise ValueError(
+                f"Unsupported audio_atom_reduction="
+                f"'{audio_atom_reduction}'. Choose from "
+                f"{sorted(valid_reductions)}."
+            )
+
+        if audio_atom_topk <= 0:
+            raise ValueError(
+                "audio_atom_topk must be greater than zero."
+            )
+
+        if audio_atom_temperature <= 0:
+            raise ValueError(
+                "audio_atom_temperature must be greater than zero."
+            )
+
+        T = video_feats.shape[0]
+
+        if T == 0:
+            raise ValueError(
+                "video_feats contains no frames."
+            )
+
+        if top_k <= 0:
+            raise ValueError(
+                "top_k must be greater than zero."
+            )
+
+        if audio.shape[-1] == 0:
+            raise ValueError(
+                "audio contains no waveform samples."
+            )
+
+        top_k = min(top_k, T)
+
+        number_of_windows = T - top_k + 1
+        num_audio_samples = audio.shape[-1]
+
+        # =============================================================
+        # Helper: aggregate dictionary atoms into class scores
+        # =============================================================
+        def aggregate_audio_atoms(
+            audio_similarity,
+            dictionary_labels,
+            num_classes,
+        ):
+            """
+            Args:
+                audio_similarity:
+                    Query-to-dictionary similarities.
+                    Shape: [B, K]
+
+                dictionary_labels:
+                    Class label for each dictionary atom.
+                    Shape: [K]
+
+                num_classes:
+                    Number of output classes.
+
+            Returns:
+                audio_class_scores:
+                    Shape: [B, num_classes]
+            """
+
+            batch_size = audio_similarity.shape[0]
+
+            # Preserve the behavior of the original function when a class
+            # has no assigned dictionary atom.
+            audio_class_scores = torch.full(
+                size=(batch_size, num_classes),
+                fill_value=-1e4,
+                device=audio_similarity.device,
+                dtype=audio_similarity.dtype,
+            )
+
+            for class_idx in range(num_classes):
+
+                class_mask = (
+                    dictionary_labels == class_idx
+                )
+
+                if not class_mask.any():
+                    continue
+
+                class_atom_scores = audio_similarity[
+                    :,
+                    class_mask,
+                ]  # [B, number_of_class_atoms]
+
+                if audio_atom_reduction == "max":
+
+                    class_score = (
+                        class_atom_scores
+                        .max(dim=-1)
+                        .values
+                    )
+
+                elif audio_atom_reduction == "mean":
+
+                    class_score = (
+                        class_atom_scores
+                        .mean(dim=-1)
+                    )
+
+                elif audio_atom_reduction == "topk_mean":
+
+                    current_topk = min(
+                        audio_atom_topk,
+                        class_atom_scores.shape[-1],
+                    )
+
+                    topk_scores = (
+                        class_atom_scores
+                        .topk(
+                            k=current_topk,
+                            dim=-1,
+                            largest=True,
+                        )
+                        .values
+                    )
+
+                    class_score = (
+                        topk_scores.mean(dim=-1)
+                    )
+
+                elif audio_atom_reduction == "softmax":
+
+                    atom_weights = F.softmax(
+                        class_atom_scores
+                        / audio_atom_temperature,
+                        dim=-1,
+                    )
+
+                    class_score = (
+                        atom_weights
+                        * class_atom_scores
+                    ).sum(dim=-1)
+
+                audio_class_scores[
+                    :,
+                    class_idx,
+                ] = class_score
+
+            return audio_class_scores
+
+        # Window selection is discrete. Gradients through all candidate
+        # windows are unnecessary.
+        with torch.no_grad():
+
+            # =========================================================
+            # 2. Construct every consecutive visual window
+            # =========================================================
+            # unfold:
+            #   [W, D, top_k]
+            #
+            # permute:
+            #   [W, top_k, D]
+            visual_windows = (
+                video_feats
+                .unfold(
+                    dimension=0,
+                    size=top_k,
+                    step=1,
+                )
+                .permute(0, 2, 1)
+                .contiguous()
+            )
+
+            # =========================================================
+            # 3. Process all visual windows in one batch
+            # =========================================================
+            temporal_features = self.temporal(
+                visual_windows.transpose(1, 2)
+            )
+
+            temporal_features = F.gelu(
+                temporal_features
+            )
+
+            visual_embeds = temporal_features.mean(
+                dim=-1
+            )  # [W, D]
+
+            visual_embeds = F.normalize(
+                visual_embeds,
+                dim=-1,
+            )
+
+            adapted_embeds_norm = F.normalize(
+                adapted_embeds,
+                dim=-1,
+            )
+
+            au_similarity = (
+                visual_embeds
+                @ adapted_embeds_norm.T
+            )  # [W, num_AUs]
+
+            visual_logits = self.temporal_classifier(
+                au_similarity
+            )  # [W, C]
+
+            visual_window_probs = F.softmax(
+                visual_logits / visual_temp,
+                dim=-1,
+            )  # [W, C]
+
+            num_classes = visual_window_probs.shape[-1]
+
+            if num_classes < 2:
+                raise ValueError(
+                    "At least two output classes are required."
+                )
+
+            # Normalized visual entropy.
+            visual_entropies = -(
+                visual_window_probs
+                * torch.log(
+                    visual_window_probs.clamp_min(1e-8)
+                )
+            ).sum(dim=-1)
+
+            visual_entropies = (
+                visual_entropies
+                / math.log(num_classes)
+            )  # [W]
+
+            # =========================================================
+            # 4. Extract OpenSMILE features from complete audio once
+            # =========================================================
+            audio_embeds_norm = (
+                self.extract_opensmile_batch(
+                    audio,
+                    sample_rate=sample_rate,
+                )
+            )  # [1, audio_dim]
+
+            if audio_embeds_norm.ndim == 1:
+                audio_embeds_norm = (
+                    audio_embeds_norm.unsqueeze(0)
+                )
+
+            # =========================================================
+            # 5. Prepare fixed audio dictionary
+            # =========================================================
+            audio_dictionary = self.audio_dictionary.to(
+                device=audio_embeds_norm.device,
+                dtype=audio_embeds_norm.dtype,
+            )
+
+            if audio_dictionary.ndim != 2:
+                raise ValueError(
+                    "self.audio_dictionary must have shape "
+                    "[num_atoms, audio_dim]."
+                )
+
+            if (
+                audio_embeds_norm.shape[-1]
+                != audio_dictionary.shape[-1]
+            ):
+                raise ValueError(
+                    "OpenSMILE feature dimension does not match "
+                    "the audio dictionary dimension: "
+                    f"{audio_embeds_norm.shape[-1]} versus "
+                    f"{audio_dictionary.shape[-1]}."
+                )
+
+            audio_embeds_norm = F.normalize(
+                audio_embeds_norm,
+                dim=-1,
+            )
+
+            audio_dictionary_norm = F.normalize(
+                audio_dictionary,
+                dim=-1,
+            )
+
+            # Query-to-dictionary cosine similarity.
+            audio_similarity = (
+                audio_embeds_norm
+                @ audio_dictionary_norm.T
+            )  # [1, K]
+
+            dictionary_labels = (
+                self.audio_cluster_labels
+                .to(audio_similarity.device)
+                .long()
+            )
+
+            if dictionary_labels.ndim != 1:
+                raise ValueError(
+                    "self.audio_cluster_labels must have "
+                    "shape [num_atoms]."
+                )
+
+            if (
+                dictionary_labels.shape[0]
+                != audio_dictionary.shape[0]
+            ):
+                raise ValueError(
+                    "The number of audio cluster labels must match "
+                    "the number of audio dictionary atoms."
+                )
+
+            # =========================================================
+            # 6. Aggregate audio atoms into class scores
+            # =========================================================
+            audio_class_scores = aggregate_audio_atoms(
+                audio_similarity=audio_similarity,
+                dictionary_labels=dictionary_labels,
+                num_classes=num_classes,
+            )  # [1, C]
+
+            audio_prob = F.softmax(
+                audio_class_scores / audio_temp,
+                dim=-1,
+            )  # [1, C]
+
+            # Move audio outputs to the visual tensor device.
+            audio_class_scores = audio_class_scores.to(
+                device=visual_window_probs.device,
+                dtype=visual_window_probs.dtype,
+            )
+
+            audio_prob = audio_prob.to(
+                device=visual_window_probs.device,
+                dtype=visual_window_probs.dtype,
+            )
+
+            # The complete-audio prediction guides every visual window.
+            audio_prob_expanded = audio_prob.expand(
+                number_of_windows,
+                -1,
+            )  # [W, C]
+
+            # =========================================================
+            # 7. Calculate visual-audio JS divergence
+            # =========================================================
+            mixture_prob = 0.5 * (
+                visual_window_probs
+                + audio_prob_expanded
+            )
+
+            visual_to_mixture = (
+                visual_window_probs
+                * (
+                    torch.log(
+                        visual_window_probs.clamp_min(1e-8)
+                    )
+                    - torch.log(
+                        mixture_prob.clamp_min(1e-8)
+                    )
+                )
+            ).sum(dim=-1)
+
+            audio_to_mixture = (
+                audio_prob_expanded
+                * (
+                    torch.log(
+                        audio_prob_expanded.clamp_min(1e-8)
+                    )
+                    - torch.log(
+                        mixture_prob.clamp_min(1e-8)
+                    )
+                )
+            ).sum(dim=-1)
+
+            js_divergence = 0.5 * (
+                visual_to_mixture
+                + audio_to_mixture
+            )
+
+            # Normalize JS divergence to approximately [0, 1].
+            js_divergence = (
+                js_divergence / math.log(2.0)
+            )  # [W]
+
+            # =========================================================
+            # 8. Calculate final window-selection score
+            # =========================================================
+            selection_scores = (
+                visual_entropies
+                + audio_guidance_strength
+                * js_divergence
+            )
+
+            selected_start = int(
+                selection_scores.argmin().item()
+            )
+
+        # =============================================================
+        # 9. Construct selected visual window
+        # =============================================================
+        selected_end = selected_start + top_k
+
+        selected_idx = list(
+            range(
+                selected_start,
+                selected_end,
+            )
+        )
+
+        selected_video_feats = video_feats[
+            selected_start:selected_end
+        ]
+
+        # =============================================================
+        # 10. Crop synchronized audio
+        # =============================================================
+        selected_audio_start = round(
+            selected_start
+            / T
+            * num_audio_samples
+        )
+
+        selected_audio_end = round(
+            selected_end
+            / T
+            * num_audio_samples
+        )
+
+        selected_audio_start = max(
+            0,
+            min(
+                selected_audio_start,
+                num_audio_samples - 1,
+            ),
+        )
+
+        selected_audio_end = max(
+            selected_audio_start + 1,
+            min(
+                selected_audio_end,
+                num_audio_samples,
+            ),
+        )
+
+        selected_audio = audio[
+            :,
+            selected_audio_start:selected_audio_end,
+        ]
+
+        # =============================================================
+        # 11. Return selection and diagnostics
+        # =============================================================
+        return {
+            "selected_idx": selected_idx,
+            "selected_start": selected_start,
+            "selected_end": selected_end,
+
+            "selected_video_feats": (
+                selected_video_feats
+            ),
+
+            "selected_audio": selected_audio,
+            "selected_audio_start": (
+                selected_audio_start
+            ),
+            "selected_audio_end": (
+                selected_audio_end
+            ),
+
+            "selected_visual_prob": (
+                visual_window_probs[
+                    selected_start:selected_start + 1
+                ]
+            ),
+
+            # Calculated from the complete waveform.
+            "audio_prob": audio_prob,
+
+            "audio_class_scores": (
+                audio_class_scores
+            ),
+
+            "audio_similarity": (
+                audio_similarity
+            ),
+
+            "selected_visual_entropy": (
+                visual_entropies[selected_start]
+            ),
+
+            "selected_js_divergence": (
+                js_divergence[selected_start]
+            ),
+
+            "selected_selection_score": (
+                selection_scores[selected_start]
+            ),
+
+            "audio_atom_reduction": (
+                audio_atom_reduction
+            ),
+
+            # Candidate-window diagnostics
+            "visual_window_probs": (
+                visual_window_probs
+            ),
+
+            "visual_entropies": (
+                visual_entropies
+            ),
+
+            "js_divergence": (
+                js_divergence
+            ),
+
+            "selection_scores": (
+                selection_scores
+            ),
+        }
+
+
+    def select_key_consec_frames_multimodal_topm(
+        self,
+        video_feats,
+        audio,
+        adapted_embeds,
+        top_k=16,
+        top_m=3,
+        sample_rate=16000,
+        visual_temp=1.0,
+        audio_temp=0.2,
+        visual_weight=0.28,
+        audio_weight=0.72,
+        audio_atom_reduction="max",
+        audio_atom_topk=2,
+        audio_atom_temperature=0.1,
+    ):
+        """
+        Select a synchronized visual-audio temporal window using two stages.
+
+        Stage 1:
+            Evaluate every consecutive visual window and retain the top-M
+            windows with the lowest visual prediction entropy.
+
+        Stage 2:
+            Extract the synchronized audio for only those top-M windows,
+            compute local audio predictions, fuse visual and audio
+            probabilities, and select the window with the lowest fused
+            prediction entropy.
+
+        Args:
+            video_feats:
+                Frame-level visual features.
+                Shape: [T, D]
+
+            audio:
+                Complete waveform synchronized with all T visual frames.
+                Shape: [1, S] or [S]
+
+            adapted_embeds:
+                Adapted AU text embeddings.
+                Shape: [num_AUs, D]
+
+            top_k:
+                Number of consecutive visual frames in each window.
+
+            top_m:
+                Number of visually informative windows passed to the
+                audio reranking stage.
+
+            sample_rate:
+                Audio sampling rate used for OpenSMILE extraction.
+
+            visual_temp:
+                Temperature applied to visual logits.
+
+            audio_temp:
+                Temperature applied to audio class scores.
+
+            visual_weight:
+                Visual contribution during candidate reranking.
+
+            audio_weight:
+                Audio contribution during candidate reranking.
+
+            audio_atom_reduction:
+                How dictionary atoms belonging to the same class are
+                converted into one class score.
+
+                Supported:
+                    "max"
+                    "mean"
+                    "topk_mean"
+                    "softmax"
+
+            audio_atom_topk:
+                Number of closest atoms used when
+                audio_atom_reduction="topk_mean".
+
+            audio_atom_temperature:
+                Temperature for weighting atoms when
+                audio_atom_reduction="softmax".
+
+                Smaller:
+                    behaves more like max.
+
+                Larger:
+                    distributes weight more evenly across atoms.
+
+        Required class attributes:
+            self.temporal
+            self.temporal_classifier
+            self.extract_opensmile_batch
+            self.audio_dictionary
+            self.audio_dictionary_labels
+
+        Returns:
+            Dictionary containing the selected visual indices, selected
+            visual features, synchronized audio waveform, modality
+            probabilities, and candidate diagnostics.
+        """
+
+        # =============================================================
+        # 1. Validate inputs
+        # =============================================================
+        if video_feats.ndim != 2:
+            raise ValueError(
+                "video_feats must have shape [T, D], "
+                f"but received {tuple(video_feats.shape)}."
+            )
+
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+
+        if audio.ndim != 2 or audio.shape[0] != 1:
+            raise ValueError(
+                "audio must have shape [1, S] or [S], "
+                f"but received {tuple(audio.shape)}."
+            )
+
+        if adapted_embeds.ndim != 2:
+            raise ValueError(
+                "adapted_embeds must have shape [num_AUs, D], "
+                f"but received {tuple(adapted_embeds.shape)}."
+            )
+
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        if top_m <= 0:
+            raise ValueError("top_m must be greater than zero.")
+
+        if visual_temp <= 0:
+            raise ValueError("visual_temp must be greater than zero.")
+
+        if audio_temp <= 0:
+            raise ValueError("audio_temp must be greater than zero.")
+
+        if visual_weight < 0 or audio_weight < 0:
+            raise ValueError(
+                "visual_weight and audio_weight cannot be negative."
+            )
+
+        if visual_weight + audio_weight <= 0:
+            raise ValueError(
+                "At least one modality weight must be positive."
+            )
+
+        valid_reductions = {
+            "max",
+            "mean",
+            "topk_mean",
+            "softmax",
+        }
+
+        if audio_atom_reduction not in valid_reductions:
+            raise ValueError(
+                f"Unsupported audio_atom_reduction="
+                f"'{audio_atom_reduction}'. "
+                f"Choose from {sorted(valid_reductions)}."
+            )
+
+        if audio_atom_topk <= 0:
+            raise ValueError(
+                "audio_atom_topk must be greater than zero."
+            )
+
+        if audio_atom_temperature <= 0:
+            raise ValueError(
+                "audio_atom_temperature must be greater than zero."
+            )
+
+        T = video_feats.shape[0]
+
+        if T == 0:
+            raise ValueError("video_feats contains no frames.")
+
+        if audio.shape[-1] == 0:
+            raise ValueError("audio waveform contains no samples.")
+
+        top_k = min(top_k, T)
+
+        num_windows = T - top_k + 1
+        top_m = min(top_m, num_windows)
+
+        num_audio_samples = audio.shape[-1]
+
+        # Normalize the fusion weights.
+        total_modality_weight = visual_weight + audio_weight
+
+        visual_weight = (
+            visual_weight / total_modality_weight
+        )
+
+        audio_weight = (
+            audio_weight / total_modality_weight
+        )
+
+        # =============================================================
+        # Internal helper: aggregate atoms into class scores
+        # =============================================================
+        def aggregate_audio_atom_scores(
+            audio_similarity,
+            dictionary_labels,
+            num_classes,
+        ):
+            """
+            Args:
+                audio_similarity:
+                    Shape [B, K].
+
+                dictionary_labels:
+                    Class label for every dictionary atom.
+                    Shape [K].
+
+            Returns:
+                Class-level audio scores [B, num_classes].
+            """
+
+            batch_size = audio_similarity.shape[0]
+
+            audio_class_scores = torch.empty(
+                batch_size,
+                num_classes,
+                device=audio_similarity.device,
+                dtype=audio_similarity.dtype,
+            )
+
+            for class_idx in range(num_classes):
+
+                class_mask = (
+                    dictionary_labels == class_idx
+                )
+
+                if not class_mask.any():
+                    raise ValueError(
+                        f"No audio dictionary atom is assigned "
+                        f"to class {class_idx}."
+                    )
+
+                class_atom_scores = audio_similarity[
+                    :,
+                    class_mask,
+                ]  # [B, number_of_class_atoms]
+
+                if audio_atom_reduction == "max":
+
+                    class_score = (
+                        class_atom_scores
+                        .max(dim=-1)
+                        .values
+                    )
+
+                elif audio_atom_reduction == "mean":
+
+                    class_score = (
+                        class_atom_scores
+                        .mean(dim=-1)
+                    )
+
+                elif audio_atom_reduction == "topk_mean":
+
+                    current_topk = min(
+                        audio_atom_topk,
+                        class_atom_scores.shape[-1],
+                    )
+
+                    top_atom_scores = (
+                        class_atom_scores.topk(
+                            k=current_topk,
+                            dim=-1,
+                            largest=True,
+                        ).values
+                    )
+
+                    class_score = (
+                        top_atom_scores.mean(dim=-1)
+                    )
+
+                elif audio_atom_reduction == "softmax":
+
+                    atom_weights = F.softmax(
+                        class_atom_scores
+                        / audio_atom_temperature,
+                        dim=-1,
+                    )
+
+                    class_score = (
+                        atom_weights
+                        * class_atom_scores
+                    ).sum(dim=-1)
+
+                audio_class_scores[
+                    :,
+                    class_idx,
+                ] = class_score
+
+            return audio_class_scores
+
+        # The window search is discrete, so gradients through all
+        # candidates are unnecessary.
+        with torch.no_grad():
+
+            # =========================================================
+            # 2. Generate all consecutive visual windows
+            # =========================================================
+            # video_feats.unfold produces [W, D, top_k].
+            # Permuting gives [W, top_k, D].
+            visual_windows = (
+                video_feats
+                .unfold(
+                    dimension=0,
+                    size=top_k,
+                    step=1,
+                )
+                .permute(0, 2, 1)
+                .contiguous()
+            )
+
+            # =========================================================
+            # 3. Process all visual candidates in one batch
+            # =========================================================
+            temporal_features = self.temporal(
+                visual_windows.transpose(1, 2)
+            )  # [W, temporal_dim, temporal_length]
+
+            temporal_features = F.gelu(
+                temporal_features
+            )
+
+            visual_embeds = temporal_features.mean(
+                dim=-1
+            )  # [W, D]
+
+            visual_embeds = F.normalize(
+                visual_embeds,
+                dim=-1,
+            )
+
+            adapted_embeds_norm = F.normalize(
+                adapted_embeds,
+                dim=-1,
+            )
+
+            au_similarity = (
+                visual_embeds
+                @ adapted_embeds_norm.T
+            )  # [W, num_AUs]
+
+            visual_logits = self.temporal_classifier(
+                au_similarity
+            )  # [W, C]
+
+            visual_probs = F.softmax(
+                visual_logits / visual_temp,
+                dim=-1,
+            )  # [W, C]
+
+            num_classes = visual_probs.shape[-1]
+
+            if num_classes < 2:
+                raise ValueError(
+                    "The temporal classifier must output at least "
+                    "two classes."
+                )
+
+            visual_entropies = -(
+                visual_probs
+                * torch.log(
+                    visual_probs.clamp_min(1e-8)
+                )
+            ).sum(dim=-1)
+
+            visual_entropies = (
+                visual_entropies
+                / math.log(num_classes)
+            )  # [W]
+
+            # =========================================================
+            # 4. Select top-M visual candidates
+            # =========================================================
+            candidate_indices = torch.topk(
+                visual_entropies,
+                k=top_m,
+                largest=False,
+            ).indices  # [top_m]
+
+            # =========================================================
+            # 5. Prepare fixed audio dictionary
+            # =========================================================
+            audio_dictionary = self.audio_dictionary
+
+            if audio_dictionary.ndim != 2:
+                raise ValueError(
+                    "self.audio_dictionary must have shape "
+                    "[num_atoms, audio_feature_dim]."
+                )
+
+            dictionary_labels = (
+                self.audio_cluster_labels
+                .long()
+            )
+
+            if dictionary_labels.ndim != 1:
+                raise ValueError(
+                    "self.audio_dictionary_labels must have "
+                    "shape [num_atoms]."
+                )
+
+            if (
+                dictionary_labels.shape[0]
+                != audio_dictionary.shape[0]
+            ):
+                raise ValueError(
+                    "The number of dictionary labels does not match "
+                    "the number of audio dictionary atoms."
+                )
+
+            # =========================================================
+            # 6. Audio reranking for top-M visual candidates
+            # =========================================================
+            candidate_visual_probs = []
+            candidate_audio_probs = []
+            candidate_audio_class_scores = []
+            candidate_fused_probs = []
+            candidate_fused_entropies = []
+
+            candidate_audio_segments = []
+            candidate_audio_starts = []
+            candidate_audio_ends = []
+
+            for candidate_idx_tensor in candidate_indices:
+
+                candidate_idx = int(
+                    candidate_idx_tensor.item()
+                )
+
+                visual_start = candidate_idx
+                visual_end = candidate_idx + top_k
+
+                # -----------------------------------------------------
+                # Map visual interval to synchronized waveform interval
+                # -----------------------------------------------------
+                audio_start = round(
+                    visual_start
+                    / T
+                    * num_audio_samples
+                )
+
+                audio_end = round(
+                    visual_end
+                    / T
+                    * num_audio_samples
+                )
+
+                audio_start = max(
+                    0,
+                    min(
+                        audio_start,
+                        num_audio_samples - 1,
+                    ),
+                )
+
+                audio_end = max(
+                    audio_start + 1,
+                    min(
+                        audio_end,
+                        num_audio_samples,
+                    ),
+                )
+
+                audio_window = audio[
+                    :,
+                    audio_start:audio_end,
+                ]
+
+                # -----------------------------------------------------
+                # Extract OpenSMILE features for this local audio window
+                # -----------------------------------------------------
+                audio_embedding = (
+                    self.extract_opensmile_batch(
+                        audio_window,
+                        sample_rate=sample_rate,
+                    )
+                )
+
+                if audio_embedding.ndim == 1:
+                    audio_embedding = (
+                        audio_embedding.unsqueeze(0)
+                    )
+
+                audio_dictionary_current = (
+                    audio_dictionary.to(
+                        device=audio_embedding.device,
+                        dtype=audio_embedding.dtype,
+                    )
+                )
+
+                dictionary_labels_current = (
+                    dictionary_labels.to(
+                        audio_embedding.device
+                    )
+                )
+
+                if (
+                    audio_embedding.shape[-1]
+                    != audio_dictionary_current.shape[-1]
+                ):
+                    raise ValueError(
+                        "OpenSMILE embedding dimension does not "
+                        "match the audio dictionary dimension: "
+                        f"{audio_embedding.shape[-1]} versus "
+                        f"{audio_dictionary_current.shape[-1]}."
+                    )
+
+                # Cosine-normalize query and dictionary.
+                audio_embedding = F.normalize(
+                    audio_embedding,
+                    dim=-1,
+                )
+
+                audio_dictionary_norm = F.normalize(
+                    audio_dictionary_current,
+                    dim=-1,
+                )
+
+                # -----------------------------------------------------
+                # Similarity to all dictionary atoms
+                # -----------------------------------------------------
+                audio_similarity = (
+                    audio_embedding
+                    @ audio_dictionary_norm.T
+                )  # [1, K]
+
+                # -----------------------------------------------------
+                # Aggregate atoms into class-level scores
+                # -----------------------------------------------------
+                audio_class_scores = (
+                    aggregate_audio_atom_scores(
+                        audio_similarity=audio_similarity,
+                        dictionary_labels=(
+                            dictionary_labels_current
+                        ),
+                        num_classes=num_classes,
+                    )
+                )  # [1, C]
+
+                audio_prob = F.softmax(
+                    audio_class_scores / audio_temp,
+                    dim=-1,
+                )  # [1, C]
+
+                # -----------------------------------------------------
+                # Get corresponding visual probability
+                # -----------------------------------------------------
+                visual_prob = visual_probs[
+                    candidate_idx:candidate_idx + 1
+                ].to(
+                    device=audio_prob.device,
+                    dtype=audio_prob.dtype,
+                )
+
+                # -----------------------------------------------------
+                # Fuse synchronized visual and audio probabilities
+                # -----------------------------------------------------
+                fused_prob = (
+                    visual_weight * visual_prob
+                    + audio_weight * audio_prob
+                )
+
+                fused_prob = (
+                    fused_prob
+                    / fused_prob.sum(
+                        dim=-1,
+                        keepdim=True,
+                    ).clamp_min(1e-8)
+                )
+
+                fused_entropy = -(
+                    fused_prob
+                    * torch.log(
+                        fused_prob.clamp_min(1e-8)
+                    )
+                ).sum(dim=-1)
+
+                fused_entropy = (
+                    fused_entropy
+                    / math.log(num_classes)
+                )
+
+                # -----------------------------------------------------
+                # Store candidate information
+                # -----------------------------------------------------
+                candidate_visual_probs.append(
+                    visual_prob.squeeze(0)
+                )
+
+                candidate_audio_probs.append(
+                    audio_prob.squeeze(0)
+                )
+
+                candidate_audio_class_scores.append(
+                    audio_class_scores.squeeze(0)
+                )
+
+                candidate_fused_probs.append(
+                    fused_prob.squeeze(0)
+                )
+
+                candidate_fused_entropies.append(
+                    fused_entropy.squeeze(0)
+                )
+
+                candidate_audio_segments.append(
+                    audio_window
+                )
+
+                candidate_audio_starts.append(
+                    audio_start
+                )
+
+                candidate_audio_ends.append(
+                    audio_end
+                )
+
+            # =========================================================
+            # 7. Select lowest-entropy fused candidate
+            # =========================================================
+            candidate_visual_probs = torch.stack(
+                candidate_visual_probs,
+                dim=0,
+            )  # [top_m, C]
+
+            candidate_audio_probs = torch.stack(
+                candidate_audio_probs,
+                dim=0,
+            )  # [top_m, C]
+
+            candidate_audio_class_scores = torch.stack(
+                candidate_audio_class_scores,
+                dim=0,
+            )  # [top_m, C]
+
+            candidate_fused_probs = torch.stack(
+                candidate_fused_probs,
+                dim=0,
+            )  # [top_m, C]
+
+            candidate_fused_entropies = torch.stack(
+                candidate_fused_entropies,
+                dim=0,
+            )  # [top_m]
+
+            best_local_idx = int(
+                candidate_fused_entropies
+                .argmin()
+                .item()
+            )
+
+            selected_start = int(
+                candidate_indices[
+                    best_local_idx
+                ].item()
+            )
+
+            selected_end = selected_start + top_k
+
+            selected_audio = (
+                candidate_audio_segments[
+                    best_local_idx
+                ]
+            )
+
+            selected_audio_start = (
+                candidate_audio_starts[
+                    best_local_idx
+                ]
+            )
+
+            selected_audio_end = (
+                candidate_audio_ends[
+                    best_local_idx
+                ]
+            )
+
+        # =============================================================
+        # 8. Return selected synchronized window and diagnostics
+        # =============================================================
+        selected_idx = list(
+            range(
+                selected_start,
+                selected_end,
+            )
+        )
+
+        return {
+            "selected_idx": selected_idx,
+            "selected_start": selected_start,
+            "selected_end": selected_end,
+
+            "selected_video_feats": video_feats[
+                selected_start:selected_end
+            ],
+
+            "selected_audio": selected_audio,
+            "selected_audio_start": selected_audio_start,
+            "selected_audio_end": selected_audio_end,
+
+            "selected_visual_prob": (
+                candidate_visual_probs[
+                    best_local_idx:best_local_idx + 1
+                ]
+            ),
+
+            "selected_audio_prob": (
+                candidate_audio_probs[
+                    best_local_idx:best_local_idx + 1
+                ]
+            ),
+
+            "selected_audio_class_scores": (
+                candidate_audio_class_scores[
+                    best_local_idx:best_local_idx + 1
+                ]
+            ),
+
+            "selected_fused_prob": (
+                candidate_fused_probs[
+                    best_local_idx:best_local_idx + 1
+                ]
+            ),
+
+            "selected_visual_entropy": (
+                visual_entropies[selected_start]
+            ),
+
+            "selected_fused_entropy": (
+                candidate_fused_entropies[
+                    best_local_idx
+                ]
+            ),
+
+            # Candidate diagnostics
+            "candidate_indices": candidate_indices,
+            "candidate_visual_probs": (
+                candidate_visual_probs
+            ),
+            "candidate_audio_probs": (
+                candidate_audio_probs
+            ),
+            "candidate_audio_class_scores": (
+                candidate_audio_class_scores
+            ),
+            "candidate_fused_probs": (
+                candidate_fused_probs
+            ),
+            "candidate_fused_entropies": (
+                candidate_fused_entropies
+            ),
+
+            "visual_window_probs": visual_probs,
+            "visual_entropies": visual_entropies,
+
+            "audio_atom_reduction": (
+                audio_atom_reduction
+            ),
+        }
+
+    def temporal_clip_au_forward(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=False, key_frame_sel=False, train_whole_clip=False, key_frames=16, is_opensmile_dict=False):
+    
         """
         Simple temporal CLIP forward:
         1. Extract CLIP embeddings per frame.
@@ -1620,7 +4489,46 @@ class ClipTestTimeVideoTuning(nn.Module):
                     Rebuttal Test: Select key frames using temporal module 
                     [INFO] Selecting Window using Temporal Module: window->AU-sim->EmoClassifier->Entropy: select frame window with lowest entropy										
                 '''
-                key_idx = self.select_key_consec_frames_temporal(frame_feats, text_embeds_norm, top_k=key_frames) 
+                # key_idx = self.select_key_consec_frames_temporal(frame_feats, text_embeds_norm, top_k=key_frames) 
+                # selected_feats.append(frame_feats[key_idx])
+
+                # selection = self.select_key_consec_frames_multimodal(
+                #     video_feats=frame_feats,       # [30, D]
+                #     audio=audio,                   # [1, 464000]
+                #     adapted_embeds=text_embeds_norm,
+                #     top_k=key_frames,
+                #     sample_rate=16000,
+                #     visual_temp=1.0,
+                #     audio_temp=1.0, #0.2
+                #     visual_selection_weight=0.5,
+                #     audio_selection_weight=0.5,
+                # )
+
+                selection = self.select_key_consec_frames_audio_guided(
+                    video_feats=frame_feats,
+                    audio=audio,
+                    adapted_embeds=text_embeds_norm,
+                    top_k=16,
+                    sample_rate=16000,
+                    visual_temp=1.0,
+                    audio_temp=0.2,
+                    audio_guidance_strength=0.25,
+                    audio_atom_reduction="softmax"
+                )
+
+                # selection = self.select_key_consec_frames_multimodal_topm(
+                #     video_feats=frame_feats,
+                #     audio=audio,
+                #     adapted_embeds=text_embeds_norm,
+                #     top_k=key_frames,
+                #     top_m=3,
+                #     visual_temp=1.0,
+                #     audio_temp=0.2,
+                #     visual_weight=0.28,
+                #     audio_weight=0.72,
+                #     audio_atom_reduction="mean",
+                # )
+                key_idx = selection["selected_idx"]
                 selected_feats.append(frame_feats[key_idx])
 
             # # 3️⃣ Stack for temporal model
@@ -1639,74 +4547,220 @@ class ClipTestTimeVideoTuning(nn.Module):
         NEW PART: Modalities Align + Fusion
         '''
 
-        # 🔹 Step A: Contrastive alignment (OmniBind Idea) -- but it cannot directly applied here
-        if mod_align:
-            contr_temp = 0.07   # hard-coded 
-            # contr_temp = self.contr_logit_scale       # learnable 
-            contr_logits = audio_embeds_norm @ visual_embeds_norm.T / contr_temp
-            ss_labels = torch.arange(B).to(contr_logits.device)
+        """
+        Process Audio
 
-            L_align = (
-                F.cross_entropy(contr_logits, ss_labels) +
-                F.cross_entropy(contr_logits.T, ss_labels)
-            ) / 2
+        """
+        # --- Option-1: Use only visual for window selection 
+        # selected_audio = self.crop_synchronized_audio(
+        #     audio=audio,
+        #     total_frames=video.shape[1],  # 30
+        #     window_start=key_idx[0],
+        #     window_size=key_frames,
+        # )
+
+        # --- Option-2: Use visual+Audio for window selection 
+        selected_audio = selection["selected_audio"]
+
+        if is_opensmile_dict:
+            audio_embeds_norm = self.extract_opensmile_batch(selected_audio, sample_rate=16000)
         else:
-            L_align = None
+            # inputs = self.audio_fe(audio, sampling_rate=16000, return_tensors="pt")
+            # Check the last dimension (temporal length)
+            if audio.shape[-1] < 100:
+                print(f"Audio shape {audio.shape} is too short!")
+            base_audio_embeds = self.audio_model(audio)  # (B, 1024)
+        # audio_embeds = self.audio_adapter(base_audio_embeds)  # (B, 512)
+        # audio_embeds_norm = F.normalize(audio_embeds, p=2, dim=-1)
 
-        # 🔹 Step B: Fusion (Concatenation)
-        if fus_type == config.FUS_CONCAT:
-            fused_embeds = torch.cat(
-                [audio_embeds_norm, visual_embeds_norm],
-                dim=-1
-            )  # (B, 1024)
 
-            fused_embeds = self.fusion_mlp(fused_embeds)  # (B, 512)
+        if not is_opensmile_dict:
+            # 🔹 Step B: Fusion (Concatenation)
+            if fus_type == config.FUS_CONCAT:
+                fused_embeds = torch.cat(
+                    [audio_embeds_norm, visual_embeds_norm],
+                    dim=-1
+                )  # (B, 1024)
 
-        # Step B (ii): Fusion (CrossAttention)
-        elif fus_type == config.FUS_CROSSATEN:
-            z_va, _ = self.crossAtten_fusion(visual_embeds_norm, audio_embeds_norm)
-            z_av, _ = self.crossAtten_fusion(audio_embeds_norm, visual_embeds_norm)  # a attends to v
+                fused_embeds = self.fusion_mlp(fused_embeds)  # (B, 512)
 
-            fused_embeds = (z_va + z_av) / 2
+            # Step B (ii): Fusion (CrossAttention)
+            elif fus_type == config.FUS_CROSSATEN:
+                z_va, _ = self.crossAtten_fusion(visual_embeds_norm, audio_embeds_norm)
+                z_av, _ = self.crossAtten_fusion(audio_embeds_norm, visual_embeds_norm)  # a attends to v
 
-        elif fus_type == config.FUS_GATED:
-            gate = torch.sigmoid(self.gated_fusion(torch.cat([visual_embeds_norm, audio_embeds_norm], dim=-1)))
-            fused_embeds = gate * visual_embeds_norm + (1 - gate) * audio_embeds_norm
+                fused_embeds = (z_va + z_av) / 2
+            
+            # Step B (iii): Fusion (GATED: give dominant modality more weight)
+            elif fus_type == config.FUS_GATED:
+                gate = torch.sigmoid(self.gated_fusion(torch.cat([visual_embeds_norm, audio_embeds_norm], dim=-1)))
+                fused_embeds = gate * visual_embeds_norm + (1 - gate) * audio_embeds_norm
 
-        elif fus_type == config.FUS_MOE:
-            weights = torch.softmax(self.router(torch.cat([visual_embeds_norm.detach(), audio_embeds_norm.detach()], dim=-1)), dim=-1)
-            fused_embeds = weights[:, 0:1] * visual_embeds_norm + weights[:, 1:2] * audio_embeds_norm
+            elif fus_type == config.FUS_MOE:
+                weights = torch.softmax(self.router(torch.cat([visual_embeds_norm.detach(), audio_embeds_norm.detach()], dim=-1)), dim=-1)
+                fused_embeds = weights[:, 0:1] * visual_embeds_norm + weights[:, 1:2] * audio_embeds_norm
 
-        # 4️⃣ Cosine similarity between temporal embedding & AUs
-        # logit_scale = self.logit_scale.exp()
-        # au_sim = logit_scale * (v @ adapted_embeds.T)   # [B, num_aus]
-        temp = 5.00
-        fused_embeds = F.normalize(fused_embeds, dim=-1)
-        au_sim = temp * (fused_embeds @ text_embeds_norm.T)
-        if adapt_tar:
-            au_sim.retain_grad()
+            # 4️⃣ Cosine similarity between temporal embedding & AUs
+            # logit_scale = self.logit_scale.exp()
+            # au_sim = logit_scale * (v @ adapted_embeds.T)   # [B, num_aus]
+            temp = 5.00
+            fused_embeds = F.normalize(fused_embeds, dim=-1)
+            au_sim = temp * (fused_embeds @ text_embeds_norm.T)
+            if adapt_tar:
+                au_sim.retain_grad()
 
-        # ----- *** ABlation -- include class-prompt with Au prompt
-        if base_cls_text_embeds is not None:
-            base_cls_text_embeds = F.normalize(base_cls_text_embeds, dim=-1)
-            cls_sim = temp * (visual_embeds_norm @ base_cls_text_embeds.T)
-            # class_proj = self.class_to_au(cls_sim)   # [B, 46]
-            alpha=0.5
-        logits = self.temporal_classifier(au_sim)   # [B, num_classes]
+            # ----- *** ABlation -- include class-prompt with Au prompt
+            if base_cls_text_embeds is not None:
+                base_cls_text_embeds = F.normalize(base_cls_text_embeds, dim=-1)
+                cls_sim = temp * (visual_embeds_norm @ base_cls_text_embeds.T)
+                # class_proj = self.class_to_au(cls_sim)   # [B, 46]
+                alpha=0.5
+            logits = self.temporal_classifier(au_sim)   # [B, num_classes]
 
-        if base_cls_text_embeds is not None:
-            cls_temp = 0.3
-            logits = ((1-cls_temp)*logits) + (cls_temp * cls_sim)
-        return logits, au_sim, visual_embeds_norm, L_align
+            if base_cls_text_embeds is not None:
+                cls_temp = 0.3
+                logits = ((1-cls_temp)*logits) + (cls_temp * cls_sim)
+        else:
+            # Temporary normalized view.
+            # self.audio_dictionary itself remains unchanged.
+            dictionary_for_similarity = F.normalize(
+                self.audio_dictionary,
+                p=2,
+                dim=-1,
+                eps=1e-8,
+            )
+
+            audio_similarity = (
+                audio_embeds_norm @ dictionary_for_similarity.T
+            )
+
+            visual_similarity = (visual_embeds_norm @ text_embeds_norm.T)
+
+            # visual_similarity_fused = F.layer_norm(
+            #     visual_similarity,
+            #     visual_similarity.shape[-1:],
+            # )
+
+            # audio_similarity_fused = F.layer_norm(
+            #     audio_similarity,
+            #     audio_similarity.shape[-1:],
+            # )
+
+            # joint_similarity = torch.cat(
+            #     [
+            #         visual_similarity_fused,
+            #         audio_similarity,
+            #     ],
+            #     dim=-1,
+            # )
+
+            L_align=None
+            # 🔹 Step A: Contrastive alignment (OmniBind Idea) -- but it cannot directly applied here
+            if mod_align:
+                visual_align = self.visual_align_proj(visual_embeds_norm)
+                audio_align = self.audio_align_proj(audio_embeds_norm)
+
+                visual_align = F.normalize(visual_align, p=2, dim=-1, eps=1e-8)
+                audio_align = F.normalize(audio_align, p=2, dim=-1, eps=1e-8)
+
+                contr_temp = 0.07   # hard-coded 
+                # contr_temp = self.contr_logit_scale       # learnable 
+                contr_logits = visual_align @ audio_align.T / contr_temp
+                ss_labels = torch.arange(B).to(contr_logits.device)
+
+                L_align = (
+                    F.cross_entropy(contr_logits, ss_labels) +
+                    F.cross_entropy(contr_logits.T, ss_labels)
+                ) / 2
+            else:
+                L_align = None
+
+            vis_logits = self.temporal_classifier(visual_similarity) 
+            # audio_logits = self.au_audio_classifier(audio_similarity)
+
+            audio_logits = self.audio_similarity_to_class_logits(
+                audio_similarity,
+                reduce="mean",
+            )
+
+            visual_temp=1.0
+            audio_temp=0.5      # before 0.2 for pretraining
+            visual_prob = F.softmax(
+                vis_logits / visual_temp,
+                dim=-1,
+            )
+
+            audio_prob = F.softmax(
+                audio_logits / audio_temp,
+                dim=-1,
+            )
+
+            if adapt_tar: 
+                # ---- MM-CLIP-AUTT Personalized Fusion Preference ----
                 
-    def temporal_clip_au_testime(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=False, key_frames=16):
+                # 1-option: Learnable subject_fusion_delta weight --- Not working/learning keep getting 0 
+                # -Generic fusion preference remains frozen.
+                # -Only subject_fusion_delta is updated.
+                alpha_subject = torch.sigmoid(
+                    self.audio_fusion_alpha.detach()
+                    + self.subject_fusion_delta
+                )
+                logits = (
+                    (1.0 - alpha_subject) * visual_prob
+                    + alpha_subject * audio_prob
+                )
+
+                # logits = (
+                #     visual_prob + audio_prob
+                # )
+
+                # 2-Option: Give higher weight to the dominate modality 
+                # -subject_info = self.estimate_subject_modality_weights(visual_prob, audio_prob)
+
+                # subject_info = self.certainty_aware_fusion(visual_prob=visual_prob, audio_prob=audio_prob, confidence_threshold=0.85,boost_strength=1.0)
+
+                # visual_weight = subject_info["visual_weight"]
+                # audio_weight = subject_info["audio_weight"]
+                # s_logits = (
+                #     visual_weight * visual_prob
+                #     + audio_weight * audio_prob
+                # )
+                # print(visual_prob)
+                # print(visual_weight)
+                # print(audio_prob)
+                # print(audio_weight)
+
+                # 3-option: Conservative weighting
+
+                # outputs = self.conservative_confidence_fusion(
+                #     visual_prob=visual_prob,
+                #     audio_prob=audio_prob,
+                #     base_audio_weight=float(alpha_subject),
+                #     min_audio_weight=0.30,
+                #     max_audio_weight=0.90,
+                #     high_confidence=0.65,
+                #     audio_margin=0.10,
+                #     visual_margin=0.05,
+                # )
+
+                # logits = outputs["fused_prob"]
+
+
+            else:
+                # This is for MM-CLI-AU Pre-training Step
+                alpha = torch.sigmoid(self.audio_fusion_alpha)
+                logits = (1.0 - alpha) * visual_prob + alpha * audio_prob
+
+        return logits, audio_similarity, visual_embeds_norm, L_align
+                
+    def temporal_clip_au_testime(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=False, key_frames=16, is_opensmile_dict=False):
         # 1 Get AU logits and Temporal Video Embeddings using 1DCNN for temporal
-        logits_au, au_sim, visual_embeds_norm, L_align = self.temporal_clip_au_forward(video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=True, key_frame_sel=key_frame_sel, key_frames=key_frames)
+        logits_au, au_sim, visual_embeds_norm, L_align = self.temporal_clip_au_forward(video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=True, key_frame_sel=key_frame_sel, key_frames=key_frames, is_opensmile_dict=is_opensmile_dict)
 
         return logits_au, au_sim, visual_embeds_norm, L_align
 
     # ===========================================================
-    def forward(self, x, audio, au_prompts=None, class_prompts=None, mode="temporal", adapt_target=False, key_frame_sel=False, key_frames=16, train_whole_clip=False, fus_type=config.FUS_CONCAT, mod_align=False):
+    def forward(self, x, audio, au_prompts=None, class_prompts=None, mode="temporal", adapt_target=False, key_frame_sel=False, key_frames=16, train_whole_clip=False, fus_type=config.FUS_CONCAT, mod_align=False, is_opensmile_dict=False):
         """
         mode:
           - 'temporal': sequence modeling for video (train AU adapter + AU classifier + transformer)
@@ -1716,8 +4770,8 @@ class ClipTestTimeVideoTuning(nn.Module):
             # assert x.ndim == 5, "Expected video input [B, T, 3, H, W]"
             # return self.au_pathway_logits(x, au_prompts)
             if adapt_target:
-                return self.temporal_clip_au_testime(x, au_prompts, class_prompts, key_frame_sel=key_frame_sel, key_frames=key_frames)
-            logits, au_sim, _, L_align = self.temporal_clip_au_forward(x, audio, au_prompts, class_prompts, fus_type, mod_align, train_whole_clip=train_whole_clip)
+                return self.temporal_clip_au_testime(x, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=key_frame_sel, key_frames=key_frames, is_opensmile_dict=is_opensmile_dict)
+            logits, au_sim, _, L_align = self.temporal_clip_au_forward(x, audio, au_prompts, class_prompts, fus_type, mod_align, train_whole_clip=train_whole_clip, is_opensmile_dict=is_opensmile_dict)
             return logits, au_sim , _, L_align
             # return self.forward_temporal(x, au_prompts)
 
@@ -1757,7 +4811,7 @@ class ClipTestTimeVideoTuning(nn.Module):
         return logits
 
 
-def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, num_aus=46, num_classes=2, au_prompts=None, learned_cls=False, is_video_clip=False, frame_stride=1, key_frames=16):
+def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, num_aus=46, num_classes=2, au_prompts=None, learned_cls=False, is_video_clip=False, frame_stride=1, key_frames=16, save_audio_dict=None, opensmile_scaler_path=None, audio_cluster_labels_path=None):
     if test_set in fewshot_datasets:
         classnames = eval("{}_classes".format(test_set.lower()))
     elif test_set == 'bongard':
@@ -1774,7 +4828,8 @@ def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, num_aus=46, num_class
         model = ClipTestTimeVideoTuning(device, classnames, None, au_prompts, arch=clip_arch,
                             n_ctx=n_ctx, ctx_init=ctx_init, learned_cls=learned_cls, num_aus=num_aus, num_classes=num_classes,
                             text_hidden=512, clf_hidden=256, 
-                            d_model=512, num_layers=4, nhead=8, dim_forward=2048, delta_stride=1)
+                            d_model=512, num_layers=4, nhead=8, dim_forward=2048, delta_stride=1, audio_dictionary_path=save_audio_dict, 
+                            opensmile_scaler_path=opensmile_scaler_path, audio_cluster_labels_path=audio_cluster_labels_path)
     else:
         model = ClipTestTimeTuning(device, classnames, None, arch=clip_arch,
                             n_ctx=n_ctx, ctx_init=ctx_init, learned_cls=learned_cls, num_aus=num_aus, num_classes=num_classes)
