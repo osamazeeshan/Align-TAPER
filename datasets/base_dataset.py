@@ -493,12 +493,13 @@ class BaseDataset():
                 RandomSequence(seq_size=seq_len, on_load=True)
             ])
 
-            fps, audio_sr = get_video_metadata(config.STRESS_VIDEO_PATH)
+            # fps, audio_sr = get_video_metadata(config.BAH_VIDEO_PATH if "BAH" in dataset_path else config.STRESS_VIDEO_PATH)
+            fps=24
 
             if seq_len != -1:
                 # To load video DataLoader
                 if "BAH" in dataset_path :
-                    dataset_train = TemporalBAHDataset(dataset_path, label_path_train, transform=transform_dict[phase], seq_len=seq_len, temporal_transform=temporal_transform) 
+                    dataset_train = TemporalBAHDataset(dataset_path, label_path_train, transform=transform_dict[phase], seq_len=seq_len, temporal_transform=temporal_transform, fps=fps, audio_sr=16000) 
                 else:
                     dataset_train = TemporalPainDataset(dataset_path, label_path_train, transform=transform_dict[phase], seq_len=seq_len, temporal_transform=temporal_transform, fps=fps, audio_sr=16000) 
                 # dataset_train = PainSeqDatasets(dataset_path, label_path_train, transform=transform_dict[phase], seq_len=seq_len) 

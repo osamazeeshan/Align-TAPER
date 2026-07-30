@@ -19,6 +19,8 @@ import torchvision.transforms as T
 import glob
 
 import config
+import re
+import torch.nn.functional as F
 
 
 class BSDS500(Dataset):
@@ -514,84 +516,68 @@ class TemporalPainDataset(Dataset):
         if audio_array.shape[-1] < 100:
             print(f"Audio shape {audio.shape} is too short!")
 
-        if audio_array.shape[-1] != 240000:
+        if audio_array.shape[-1] != 624000:     # for 16-frames= 240000; 20-frames= 304000; 30-frames= 464000; 40-frames= 624000; 
             print("ERROR")
 
         return frames, audio_array, label, video_dir
 
 
 
-
 class TemporalBAHDataset(Dataset):
-    # def __init__(self, img_root, label_csv, transform=None, seq_len=16,
-    #              temporal_transform=None, target_transform=None):
-    #     """
-    #     Args:
-    #         img_root (str): Root folder containing extracted frames for videos.
-    #         label_csv (str): CSV file containing [source_list, video, segment_id, label, num_frames, start_frame, end_frame].
-    #         transform (callable): Image transform applied to each frame.
-    #         seq_len (int): Max number of frames to load per segment (sampled uniformly if > seq_len).
-    #         temporal_transform (callable): Optional temporal transform on list of frame paths.
-    #         target_transform (callable): Optional transform on the label.
-    #     """
-    #     super().__init__()
-
-    #     self.img_root = img_root
-    #     self.transform = transform
-    #     self.temporal_transform = temporal_transform
-    #     self.target_transform = target_transform
-    #     self.seq_len = seq_len
-
-    #     # --- Read CSV ---
-    #     df = pd.read_csv(label_csv)
-
-    #     # --- Build a list of samples (each row = one segment) ---
-    #     self.samples = []
-    #     for _, row in df.iterrows():
-    #         video_rel_path = row["video"]
-    #         label = int(row["label"])
-    #         start_frame = int(row["start_frame"])
-    #         end_frame = int(row["end_frame"])
-    #         segment_id = int(row["segment_id"])
-
-    #         # Build directory for this video’s frames
-    #         # video_name = os.path.splitext(os.path.basename(video_rel_path))[0]
-    #         video_frame_dir = os.path.join(img_root, video_rel_path)
-
-    #         # Collect frame paths for the segment
-    #         frame_paths = []
-    #         for frame_idx in range(start_frame, end_frame + 1):
-    #             frame_file = f"frame-{frame_idx}.jpg"
-    #             frame_path = os.path.join(video_frame_dir, frame_file)
-    #             if os.path.exists(frame_path):
-    #                 frame_paths.append(frame_path)
-    #             else:
-    #                 print(f"[WARN] Missing: {frame_path}")
-
-    #         # Store one entry per segment
-    #         if len(frame_paths) > 0:
-    #             self.samples.append({
-    #                 "video": video_rel_path,
-    #                 "segment_id": segment_id,
-    #                 "frame_paths": frame_paths,
-    #                 "label": label
-    #             })
-
-    #     print(f"[INFO] Loaded {len(self.samples)} segments from {label_csv}")
-
-    def __init__(self, img_root, label_csv, transform=None, seq_len=16,
-             temporal_transform=None, target_transform=None,
-             fixed_window=500):
+    def __init__(
+        self,
+        img_root,
+        label_csv,
+        transform=None,
+        seq_len=16,
+        temporal_transform=None,
+        target_transform=None,
+        fixed_window=500,
+        fps=24,
+        audio_sr=16000,
+        audio_root=None,
+        frame_index_base=0,
+    ):
         """
         Args:
-            img_root (str): Root folder containing extracted frames for videos.
-            label_csv (str): CSV file containing:
-                [source_list, video, segment_id, label, num_frames, start_frame, end_frame]
-            transform (callable): Image transform applied to each frame.
-            seq_len (int): Model temporal sequence length (used only for padding last chunk).
-            fixed_window (int): Fixed number of frames per sub-sequence (e.g. 75).
-            temporal_transform (callable): Optional temporal transform on list of frame paths.
-            target_transform (callable): Optional transform on the label.
+            img_root:
+                Root folder containing extracted frames.
+
+            label_csv:
+                CSV file containing:
+                [source_list, video, segment_id, label,
+                 num_frames, start_frame, end_frame]
+
+            transform:
+                Image transform applied to each frame.
+
+            seq_len:
+                Model temporal sequence length.
+
+            fixed_window:
+                Fixed number of frames per sub-sequence.
+
+            temporal_transform:
+                Optional temporal transform on list of frame paths.
+
+            target_transform:
+                Optional transform on the label.
+
+            fps:
+                Frame rate used to map frame indices to audio time.
+
+            audio_sr:
+                Target audio sample rate.
+
+            audio_root:
+                Root folder for wav files. If None, the loader checks:
+                    img_root/wav
+                    dirname(img_root)/wav
+                    wav
+
+            frame_index_base:
+                Use 0 if frame-0.jpg corresponds to time 0.
+                Use 1 if frame-1.jpg corresponds to time 0.
         """
         super().__init__()
 
@@ -601,12 +587,14 @@ class TemporalBAHDataset(Dataset):
         self.target_transform = target_transform
         self.seq_len = seq_len
         self.fixed_window = fixed_window
+        self.fps = fps
+        self.audio_sr = audio_sr
+        self.audio_root = audio_root
+        self.frame_index_base = frame_index_base
 
-        # --- Read CSV ---
         df = pd.read_csv(label_csv)
         self.samples = []
 
-        # --- Iterate through each segment ---
         for _, row in df.iterrows():
             video_rel_path = row["video"]
             label = int(row["label"])
@@ -614,99 +602,477 @@ class TemporalBAHDataset(Dataset):
             end_frame = int(row["end_frame"])
             segment_id = int(row["segment_id"])
 
-            # Frame directory
-            video_frame_dir = os.path.join(img_root, video_rel_path)
+            video_frame_dir = os.path.join(
+                img_root,
+                video_rel_path,
+            )
 
-            # Collect frame paths
             frame_paths = []
             for frame_idx in range(start_frame, end_frame + 1):
                 frame_file = f"frame-{frame_idx}.jpg"
-                frame_path = os.path.join(video_frame_dir, frame_file)
+                frame_path = os.path.join(
+                    video_frame_dir,
+                    frame_file,
+                )
+
                 if os.path.exists(frame_path):
                     frame_paths.append(frame_path)
                 else:
-                    print(f"[WARN] Missing: {frame_path}")
+                    print(f"[WARN] Missing frame: {frame_path}")
 
             num_frames = len(frame_paths)
+
             if num_frames == 0:
                 continue
 
-            # --- Split logic ---
             if num_frames <= fixed_window:
-                # short segment, keep as is
                 self.samples.append({
                     "video": video_rel_path,
                     "segment_id": segment_id,
                     "frame_paths": frame_paths,
-                    "label": label
+                    "label": label,
                 })
             else:
-                # Split into 75-frame chunks
                 start = 0
+
                 while start < num_frames:
                     end = start + fixed_window
                     subclip = frame_paths[start:end]
 
-                    # If last chunk smaller than seq_len → pad or borrow
                     if len(subclip) < seq_len:
-                        # Borrow some frames from end of previous chunk if possible
                         borrow = seq_len - len(subclip)
+
                         if start - borrow >= 0:
-                            subclip = frame_paths[start - borrow:start] + subclip
+                            subclip = (
+                                frame_paths[start - borrow:start]
+                                + subclip
+                            )
                         else:
-                            # fallback: pad by repeating last frame
                             subclip += [subclip[-1]] * borrow
 
                     self.samples.append({
                         "video": video_rel_path,
                         "segment_id": segment_id,
                         "frame_paths": subclip,
-                        "label": label
+                        "label": label,
                     })
 
-                    # Move window forward
                     start += fixed_window
 
-        print(f"[INFO] Loaded {len(self.samples)} fixed-window subsequences "
-            f"(window={fixed_window}, seq_len={seq_len}) from {label_csv}")
-
+        print(
+            f"[INFO] Loaded {len(self.samples)} fixed-window subsequences "
+            f"(window={fixed_window}, seq_len={seq_len}) from {label_csv}"
+        )
 
     def __len__(self):
         return len(self.samples)
 
+    def get_frame_index(self, frame_path):
+        """
+        Extract frame index from names such as:
+            frame-123.jpg
+            frame_123.jpg
+            frame123.jpg
+        """
+        frame_name = os.path.basename(frame_path)
+        match = re.search(r"(\d+)", frame_name)
+
+        if match is None:
+            raise ValueError(
+                f"Could not extract frame index from {frame_path}"
+            )
+
+        return int(match.group(1))
+
+    def build_audio_path(self, video_rel_path):
+        """
+        Example:
+            video_rel_path:
+                Videos/82553/Visite_1/
+                82553_Question_1_2024-08-22_12-11-55_Video.mp4
+
+            audio path:
+                wav/Videos/82553/Visite_1/
+                82553_Question_1_2024-08-22_12-11-55_Video.mp4/
+                82553_Question_1_2024-08-22_12-11-55_Video.wav
+        """
+        video_name = os.path.basename(video_rel_path)
+
+        if video_name.endswith(".mp4"):
+            wav_name = video_name[:-4] + ".wav"
+        else:
+            wav_name = video_name + ".wav"
+
+        candidates = []
+
+        if self.audio_root is not None:
+            candidates.append(
+                os.path.join(
+                    self.audio_root,
+                    video_rel_path,
+                    wav_name,
+                )
+            )
+
+        candidates.extend([
+            os.path.join(
+                self.img_root,
+                "wav",
+                video_rel_path,
+                wav_name,
+            ),
+            os.path.join(
+                os.path.dirname(self.img_root),
+                "wav",
+                video_rel_path,
+                wav_name,
+            ),
+            os.path.join(
+                "wav",
+                video_rel_path,
+                wav_name,
+            ),
+        ])
+
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+
+        # Return the first candidate for warning/debugging.
+        return candidates[0]
+
+    def compute_audio_window_from_frames(self, frame_paths):
+        """
+        Convert selected visual frame indices into the corresponding
+        audio time window.
+        """
+        frame_indices = [
+            self.get_frame_index(p)
+            for p in frame_paths
+        ]
+
+        start_frame = min(frame_indices)
+        end_frame = max(frame_indices)
+
+        start_time = (
+            start_frame - self.frame_index_base
+        ) / self.fps
+
+        end_time = (
+            end_frame - self.frame_index_base + 1
+        ) / self.fps
+
+        start_time = max(0.0, start_time)
+        end_time = max(
+            start_time + 1.0 / self.fps,
+            end_time,
+        )
+
+        return start_time, end_time
+
+    def load_audio_segment(
+        self,
+        audio_path,
+        start_time,
+        end_time,
+    ):
+        """
+        Load the exact audio segment corresponding to the selected
+        visual frame window.
+        """
+        target_duration = max(
+            1.0 / self.fps,
+            end_time - start_time,
+        )
+
+        target_num_samples = max(
+            1,
+            int(round(target_duration * self.audio_sr)),
+        )
+
+        if not os.path.exists(audio_path):
+            print(f"[WARN] Missing audio file: {audio_path}")
+            return np.zeros(
+                target_num_samples,
+                dtype=np.float32,
+            )
+
+        try:
+            waveform, file_sr = torchaudio.load(audio_path)  # [C, S]
+
+            if file_sr != self.audio_sr:
+                resampler = torchaudio.transforms.Resample(
+                    file_sr,
+                    self.audio_sr,
+                )
+                waveform = resampler(waveform)
+
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(
+                    dim=0,
+                    keepdim=True,
+                )
+
+            total_samples = waveform.shape[1]
+            total_duration = total_samples / self.audio_sr
+
+            start_time = max(
+                0.0,
+                min(start_time, total_duration),
+            )
+
+            end_time = max(
+                start_time,
+                min(end_time, total_duration),
+            )
+
+            start_sample = int(round(start_time * self.audio_sr))
+            end_sample = int(round(end_time * self.audio_sr))
+
+            audio_chunk = waveform[
+                :,
+                start_sample:end_sample,
+            ]
+
+            if audio_chunk.shape[1] < target_num_samples:
+                pad_len = target_num_samples - audio_chunk.shape[1]
+                audio_chunk = F.pad(
+                    audio_chunk,
+                    (0, pad_len),
+                )
+
+            elif audio_chunk.shape[1] > target_num_samples:
+                audio_chunk = audio_chunk[
+                    :,
+                    :target_num_samples,
+                ]
+
+            audio_array = audio_chunk.squeeze(0).numpy()
+
+        except Exception as e:
+            print(
+                f"[WARN] Audio extraction failed for {audio_path}: {e}"
+            )
+            audio_array = np.zeros(
+                target_num_samples,
+                dtype=np.float32,
+            )
+
+        if np.max(np.abs(audio_array)) > 0:
+            audio_array = audio_array / (
+                np.max(np.abs(audio_array)) + 1e-8
+            )
+
+        audio_array = audio_array.astype(np.float32)
+
+        return audio_array
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
+
         frame_paths = sample["frame_paths"]
         label = sample["label"]
         video_path = sample["video"]
 
-        # --- Temporal transform ---
+        # --------------------------------------------------
+        # Temporal transform
+        # --------------------------------------------------
         if self.temporal_transform:
-            frame_paths = self.temporal_transform(frame_paths)
+            temporal_output = self.temporal_transform(frame_paths)
 
-        # --- Subsample or pad frames ---
+            if isinstance(temporal_output, tuple):
+                frame_paths = temporal_output[0]
+            else:
+                frame_paths = temporal_output
+
+        # --------------------------------------------------
+        # Subsample or pad frames
+        # --------------------------------------------------
         if len(frame_paths) > self.seq_len:
-            # Uniform sampling across segment
-            indices = torch.linspace(0, len(frame_paths) - 1, self.seq_len).long()
-            frame_paths = [frame_paths[i] for i in indices]
-        elif len(frame_paths) < self.seq_len:
-            # Repeat last frame to fill sequence
-            frame_paths += [frame_paths[-1]] * (self.seq_len - len(frame_paths))
+            indices = torch.linspace(
+                0,
+                len(frame_paths) - 1,
+                self.seq_len,
+            ).long()
 
-        # --- Load frames ---
+            frame_paths = [
+                frame_paths[i]
+                for i in indices
+            ]
+
+        elif len(frame_paths) < self.seq_len:
+            frame_paths += [
+                frame_paths[-1]
+            ] * (self.seq_len - len(frame_paths))
+
+        # --------------------------------------------------
+        # Compute synchronized audio window
+        # --------------------------------------------------
+        start_time, end_time = (
+            self.compute_audio_window_from_frames(frame_paths)
+        )
+
+        audio_path = self.build_audio_path(video_path)
+
+        audio_array = self.load_audio_segment(
+            audio_path=audio_path,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        # --------------------------------------------------
+        # Load frames
+        # --------------------------------------------------
         frames = []
+
         for frame_path in frame_paths:
             img = Image.open(frame_path).convert("RGB")
+
             if self.transform:
                 img = self.transform(img)
+
             frames.append(img)
 
-        frames = torch.stack(frames, dim=0)  # [T, C, H, W]
+        frames = torch.stack(
+            frames,
+            dim=0,
+        )  # [T, C, H, W]
 
         if self.target_transform:
             label = self.target_transform(label)
 
-        return frames, label, video_path
+        return frames, audio_array, label, video_path
+
+
+# class TemporalBAHDataset(Dataset):
+#     def __init__(self, img_root, label_csv, transform=None, seq_len=16,
+#              temporal_transform=None, target_transform=None,
+#              fixed_window=500, fps=24, audio_sr=16000):
+#         """
+#         Args:
+#             img_root (str): Root folder containing extracted frames for videos.
+#             label_csv (str): CSV file containing:
+#                 [source_list, video, segment_id, label, num_frames, start_frame, end_frame]
+#             transform (callable): Image transform applied to each frame.
+#             seq_len (int): Model temporal sequence length (used only for padding last chunk).
+#             fixed_window (int): Fixed number of frames per sub-sequence (e.g. 75).
+#             temporal_transform (callable): Optional temporal transform on list of frame paths.
+#             target_transform (callable): Optional transform on the label.
+#         """
+#         super().__init__()
+
+#         self.img_root = img_root
+#         self.transform = transform
+#         self.temporal_transform = temporal_transform
+#         self.target_transform = target_transform
+#         self.seq_len = seq_len
+#         self.fixed_window = fixed_window
+
+#         # --- Read CSV ---
+#         df = pd.read_csv(label_csv)
+#         self.samples = []
+
+#         # --- Iterate through each segment ---
+#         for _, row in df.iterrows():
+#             video_rel_path = row["video"]
+#             label = int(row["label"])
+#             start_frame = int(row["start_frame"])
+#             end_frame = int(row["end_frame"])
+#             segment_id = int(row["segment_id"])
+
+#             # Frame directory
+#             video_frame_dir = os.path.join(img_root, video_rel_path)
+
+#             # Collect frame paths
+#             frame_paths = []
+#             for frame_idx in range(start_frame, end_frame + 1):
+#                 frame_file = f"frame-{frame_idx}.jpg"
+#                 frame_path = os.path.join(video_frame_dir, frame_file)
+#                 if os.path.exists(frame_path):
+#                     frame_paths.append(frame_path)
+#                 else:
+#                     print(f"[WARN] Missing: {frame_path}")
+
+#             num_frames = len(frame_paths)
+#             if num_frames == 0:
+#                 continue
+
+#             # --- Split logic ---
+#             if num_frames <= fixed_window:
+#                 # short segment, keep as is
+#                 self.samples.append({
+#                     "video": video_rel_path,
+#                     "segment_id": segment_id,
+#                     "frame_paths": frame_paths,
+#                     "label": label
+#                 })
+#             else:
+#                 # Split into 75-frame chunks
+#                 start = 0
+#                 while start < num_frames:
+#                     end = start + fixed_window
+#                     subclip = frame_paths[start:end]
+
+#                     # If last chunk smaller than seq_len → pad or borrow
+#                     if len(subclip) < seq_len:
+#                         # Borrow some frames from end of previous chunk if possible
+#                         borrow = seq_len - len(subclip)
+#                         if start - borrow >= 0:
+#                             subclip = frame_paths[start - borrow:start] + subclip
+#                         else:
+#                             # fallback: pad by repeating last frame
+#                             subclip += [subclip[-1]] * borrow
+
+#                     self.samples.append({
+#                         "video": video_rel_path,
+#                         "segment_id": segment_id,
+#                         "frame_paths": subclip,
+#                         "label": label
+#                     })
+
+#                     # Move window forward
+#                     start += fixed_window
+
+#         print(f"[INFO] Loaded {len(self.samples)} fixed-window subsequences "
+#             f"(window={fixed_window}, seq_len={seq_len}) from {label_csv}")
+
+
+#     def __len__(self):
+#         return len(self.samples)
+
+#     def __getitem__(self, idx):
+#         sample = self.samples[idx]
+#         frame_paths = sample["frame_paths"]
+#         label = sample["label"]
+#         video_path = sample["video"]
+
+#         # --- Temporal transform ---
+#         if self.temporal_transform:
+#             frame_paths = self.temporal_transform(frame_paths)
+
+#         # --- Subsample or pad frames ---
+#         if len(frame_paths) > self.seq_len:
+#             # Uniform sampling across segment
+#             indices = torch.linspace(0, len(frame_paths) - 1, self.seq_len).long()
+#             frame_paths = [frame_paths[i] for i in indices]
+#         elif len(frame_paths) < self.seq_len:
+#             # Repeat last frame to fill sequence
+#             frame_paths += [frame_paths[-1]] * (self.seq_len - len(frame_paths))
+
+#         # --- Load frames ---
+#         frames = []
+#         for frame_path in frame_paths:
+#             img = Image.open(frame_path).convert("RGB")
+#             if self.transform:
+#                 img = self.transform(img)
+#             frames.append(img)
+
+#         frames = torch.stack(frames, dim=0)  # [T, C, H, W]
+
+#         if self.target_transform:
+#             label = self.target_transform(label)
+
+#         return frames, label, video_path
 
 
 

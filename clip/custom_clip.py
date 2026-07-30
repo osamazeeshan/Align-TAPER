@@ -837,6 +837,8 @@ class ClipTestTimeVideoTuning(nn.Module):
         # 2️⃣ Load Audio Backbone
         # -------------------------------------------------------
         audio_model, hidden_dim, audio_fe = audio_load(audio_arch, device=device)
+        # hidden_dim should be 1024
+        self.audio_proj = torch.nn.Linear(hidden_dim, 512).to(device) 
         self.audio_model = audio_model
         self.audio_fe = audio_fe
         self.num_classes = num_classes
@@ -1536,6 +1538,53 @@ class ClipTestTimeVideoTuning(nn.Module):
     
     def reset_classnames(self, classnames, arch):
         self.prompt_learner.reset_classnames(classnames, arch)
+
+
+    def extract_audio_features(self, audio, use_proj=False, normalize=True):
+        """
+        Extract audio features from the audio encoder.
+
+        Args:
+            audio: [B, T] waveform input
+            use_proj: if True, project features from 1024 -> 512
+            normalize: if True, L2-normalize features
+
+        Returns:
+            audio_embeds: [B, D]
+        """
+
+        base_audio_embeds = self.audio_model(audio)
+
+        # Handle HuggingFace-style outputs
+        if isinstance(base_audio_embeds, dict):
+            if "pooler_output" in base_audio_embeds:
+                base_audio_embeds = base_audio_embeds["pooler_output"]
+            elif "last_hidden_state" in base_audio_embeds:
+                base_audio_embeds = base_audio_embeds["last_hidden_state"]
+            else:
+                base_audio_embeds = list(base_audio_embeds.values())[0]
+
+        # Handle tuple/list outputs
+        if isinstance(base_audio_embeds, (tuple, list)):
+            base_audio_embeds = base_audio_embeds[0]
+
+        # If output is [B, T, D], average over time
+        if base_audio_embeds.dim() == 3:
+            base_audio_embeds = base_audio_embeds.mean(dim=1)
+
+        # If output has more dimensions, flatten to [B, D]
+        if base_audio_embeds.dim() > 2:
+            base_audio_embeds = base_audio_embeds.flatten(start_dim=1)
+
+        # Optional projection: 1024 -> 512
+        if use_proj:
+            base_audio_embeds = self.audio_proj(base_audio_embeds)
+
+        # Optional normalization
+        if normalize:
+            base_audio_embeds = F.normalize(base_audio_embeds, dim=-1)
+
+        return base_audio_embeds
 
     # ===========================================================
     @torch.no_grad()
@@ -4430,7 +4479,7 @@ class ClipTestTimeVideoTuning(nn.Module):
             ),
         }
 
-    def temporal_clip_au_forward(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=False, key_frame_sel=False, train_whole_clip=False, key_frames=16, is_opensmile_dict=False):
+    def temporal_clip_au_forward(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=False, key_frame_sel=False, train_whole_clip=False, key_frames=16, is_opensmile_dict=False, is_sub_spec_weights=True):
     
         """
         Simple temporal CLIP forward:
@@ -4486,7 +4535,7 @@ class ClipTestTimeVideoTuning(nn.Module):
                 frame_feats = img_feats[b]  # [T, 512]
                 # key_idx = self.select_key_consec_frames(frame_feats, text_embeds_norm, top_k=key_frames) # Biovid=16 and Stress=6
                 '''
-                    Rebuttal Test: Select key frames using temporal module 
+                    Rebuttal CLIP-AUTT Test: Select key frames using temporal module 
                     [INFO] Selecting Window using Temporal Module: window->AU-sim->EmoClassifier->Entropy: select frame window with lowest entropy										
                 '''
                 # key_idx = self.select_key_consec_frames_temporal(frame_feats, text_embeds_norm, top_k=key_frames) 
@@ -4558,9 +4607,12 @@ class ClipTestTimeVideoTuning(nn.Module):
         #     window_start=key_idx[0],
         #     window_size=key_frames,
         # )
-
+        audio_similarity, L_align = None, None
         # --- Option-2: Use visual+Audio for window selection 
-        selected_audio = selection["selected_audio"]
+        if adapt_tar and key_frame_sel:
+            selected_audio = selection["selected_audio"]
+        else:
+            selected_audio = audio
 
         if is_opensmile_dict:
             audio_embeds_norm = self.extract_opensmile_batch(selected_audio, sample_rate=16000)
@@ -4570,11 +4622,13 @@ class ClipTestTimeVideoTuning(nn.Module):
             if audio.shape[-1] < 100:
                 print(f"Audio shape {audio.shape} is too short!")
             base_audio_embeds = self.audio_model(audio)  # (B, 1024)
+            audio_fe = self.audio_proj(base_audio_embeds)  
         # audio_embeds = self.audio_adapter(base_audio_embeds)  # (B, 512)
         # audio_embeds_norm = F.normalize(audio_embeds, p=2, dim=-1)
 
 
         if not is_opensmile_dict:
+            audio_embeds_norm = F.normalize(audio_fe, p=2, dim=-1)
             # 🔹 Step B: Fusion (Concatenation)
             if fus_type == config.FUS_CONCAT:
                 fused_embeds = torch.cat(
@@ -4701,14 +4755,17 @@ class ClipTestTimeVideoTuning(nn.Module):
                 # 1-option: Learnable subject_fusion_delta weight --- Not working/learning keep getting 0 
                 # -Generic fusion preference remains frozen.
                 # -Only subject_fusion_delta is updated.
-                alpha_subject = torch.sigmoid(
-                    self.audio_fusion_alpha.detach()
-                    + self.subject_fusion_delta
-                )
-                logits = (
-                    (1.0 - alpha_subject) * visual_prob
-                    + alpha_subject * audio_prob
-                )
+                if is_sub_spec_weights:
+                    alpha_subject = torch.sigmoid(
+                        self.audio_fusion_alpha.detach()
+                        + self.subject_fusion_delta
+                    )
+                    logits = (
+                        (1.0 - alpha_subject) * visual_prob
+                        + alpha_subject * audio_prob
+                    )
+                else:
+                    logits = (visual_prob * audio_prob)
 
                 # logits = (
                 #     visual_prob + audio_prob
@@ -4750,17 +4807,18 @@ class ClipTestTimeVideoTuning(nn.Module):
                 # This is for MM-CLI-AU Pre-training Step
                 alpha = torch.sigmoid(self.audio_fusion_alpha)
                 logits = (1.0 - alpha) * visual_prob + alpha * audio_prob
+                # logits = 0 * visual_prob + (1.0) * audio_prob
 
         return logits, audio_similarity, visual_embeds_norm, L_align
                 
-    def temporal_clip_au_testime(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=False, key_frames=16, is_opensmile_dict=False):
+    def temporal_clip_au_testime(self, video, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=False, key_frames=16, is_opensmile_dict=False, is_sub_spec_weights=True):
         # 1 Get AU logits and Temporal Video Embeddings using 1DCNN for temporal
-        logits_au, au_sim, visual_embeds_norm, L_align = self.temporal_clip_au_forward(video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=True, key_frame_sel=key_frame_sel, key_frames=key_frames, is_opensmile_dict=is_opensmile_dict)
+        logits_au, au_sim, visual_embeds_norm, L_align = self.temporal_clip_au_forward(video, audio, au_prompts, class_prompts, fus_type, mod_align, adapt_tar=True, key_frame_sel=key_frame_sel, key_frames=key_frames, is_opensmile_dict=is_opensmile_dict, is_sub_spec_weights=is_sub_spec_weights)
 
         return logits_au, au_sim, visual_embeds_norm, L_align
 
     # ===========================================================
-    def forward(self, x, audio, au_prompts=None, class_prompts=None, mode="temporal", adapt_target=False, key_frame_sel=False, key_frames=16, train_whole_clip=False, fus_type=config.FUS_CONCAT, mod_align=False, is_opensmile_dict=False):
+    def forward(self, x, audio, au_prompts=None, class_prompts=None, mode="temporal", adapt_target=False, key_frame_sel=False, key_frames=16, train_whole_clip=False, fus_type=config.FUS_CONCAT, mod_align=False, is_opensmile_dict=False, is_sub_spec_weights=True):
         """
         mode:
           - 'temporal': sequence modeling for video (train AU adapter + AU classifier + transformer)
@@ -4770,7 +4828,7 @@ class ClipTestTimeVideoTuning(nn.Module):
             # assert x.ndim == 5, "Expected video input [B, T, 3, H, W]"
             # return self.au_pathway_logits(x, au_prompts)
             if adapt_target:
-                return self.temporal_clip_au_testime(x, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=key_frame_sel, key_frames=key_frames, is_opensmile_dict=is_opensmile_dict)
+                return self.temporal_clip_au_testime(x, audio, au_prompts, class_prompts, fus_type, mod_align, key_frame_sel=key_frame_sel, key_frames=key_frames, is_opensmile_dict=is_opensmile_dict, is_sub_spec_weights=is_sub_spec_weights)
             logits, au_sim, _, L_align = self.temporal_clip_au_forward(x, audio, au_prompts, class_prompts, fus_type, mod_align, train_whole_clip=train_whole_clip, is_opensmile_dict=is_opensmile_dict)
             return logits, au_sim , _, L_align
             # return self.forward_temporal(x, au_prompts)
